@@ -243,10 +243,183 @@ ${isExam ? `
   }
 }
 
+// ============================================================
+// 错题手术：打磨单个步骤（Step 1 定位病灶 / Step 2 寻找线索 / Step 3 写下炒菜程序）
+// 教练式反馈：不是改写，而是指出是否"够具体""够可操作"，并给出一个更精准的改写建议
+// ============================================================
+async function generateSurgeryStepFeedback({ stepNumber, stepName, stepContent, questionText, priorSteps = {} }) {
+  const openai = getClient();
+  if (!openai) return null;
+
+  const stepGuidance = {
+    1: {
+      name: '定位病灶',
+      goodExample: '"不是我粗心，而是我没想到要在这里加辅助线构造全等三角形。"',
+      badExample: '"我粗心了。" / "这题我不熟。" / "计算错了。"',
+      criteria: '必须具体到某个"知识点/公式/辅助线/推理步骤"——不能只说"粗心"或"不熟"。错因应是一个可命名的概念性盲点。'
+    },
+    2: {
+      name: '寻找线索',
+      goodExample: '"看到题目里有\'中点\'两个字，就应该触发\'倍长中线\'这个思路。"',
+      badExample: '"这题就该用这个方法。" / "看完题目就知道。"',
+      criteria: '必须定位到题目中某个具体的"词/条件/图形特征"——这个词就是未来的触发器。不能笼统地说"看到这类题"。'
+    },
+    3: {
+      name: '写下炒菜程序',
+      goodExample: '"以后看到\'中点 + 线段倍数关系\'，直接倍长中线构造全等。"',
+      badExample: '"以后要认真审题。" / "多做类似题。"',
+      criteria: '必须是"如果 [具体触发条件]，就 [具体动作]"的句式。触发条件要精确到关键词，动作要精确到一步可执行的方法。不能是空洞的提醒。'
+    }
+  };
+
+  const g = stepGuidance[stepNumber] || stepGuidance[1];
+
+  const systemPrompt = `你是一位熟悉金洪源《元认知心理干预技术》的学习教练。你正在帮一位中学生做"错题微型手术"——把一道错题变成一条可执行的"炒菜程序"。
+
+当前是第 ${stepNumber} 步：${g.name}
+好的例子：${g.goodExample}
+不够好的例子：${g.badExample}
+评判标准：${g.criteria}
+
+你的任务：
+- 读学生写的这一步，判断是否足够具体、可操作。
+- 如果足够好，直接给肯定并说出"好在哪"（一句话）。
+- 如果不够好，指出"哪里还模糊"（一句话），并给出一个更精准的改写建议（一句话）。
+- 不讲大道理，不夸张地鼓励，像一个真的在旁边带学生的数学老师。
+- 全程中文，输出不超过 3 句话。
+
+严格输出 JSON（不要 markdown 代码块）：
+{
+  "verdict": "good" | "needs_work",
+  "comment": "一句话判断：好在哪 / 哪里还模糊",
+  "suggestion": "如果 needs_work，给出一个更精准的改写建议；如果 good，可以给空字符串"
+}`;
+
+  const priorContext = [];
+  if (priorSteps.step1) priorContext.push(`第1步（定位病灶）：${priorSteps.step1}`);
+  if (priorSteps.step2) priorContext.push(`第2步（寻找线索）：${priorSteps.step2}`);
+
+  const userMessage = `错题：
+${questionText || '（学生未填写题目）'}
+
+${priorContext.length ? '已完成的步骤：\n' + priorContext.join('\n') + '\n\n' : ''}学生写的第 ${stepNumber} 步（${g.name}）：
+"${stepContent}"
+
+请按 JSON schema 输出你的判断。`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: getModel(),
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.3,
+      max_tokens: 400,
+      response_format: { type: 'json_object' }
+    });
+
+    const text = response?.choices?.[0]?.message?.content || '';
+    if (!text) return null;
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch (e) {
+      console.error('[LLM] generateSurgeryStepFeedback JSON parse error:', e.message, 'raw:', cleaned.slice(0, 300));
+      return null;
+    }
+  } catch (err) {
+    console.error('[LLM] generateSurgeryStepFeedback error:', err?.message || err);
+    return null;
+  }
+}
+
+// ============================================================
+// 错题手术：生成最终的"炒菜程序卡"
+// 输入学生写的三步，输出一张结构化、可收藏的错题手术卡
+// ============================================================
+async function generateSurgeryCard({ questionText, step1, step2, step3 }) {
+  const openai = getClient();
+  if (!openai) return null;
+
+  const systemPrompt = `你是一位熟悉金洪源《元认知心理干预技术》的学习教练。学生刚做完一道错题的"微型手术"，写完了三步：
+第一步（定位病灶）：这道题错在哪个具体的概念/公式？
+第二步（寻找线索）：题目中哪个词/条件本来应该触发这个公式？
+第三步（写下炒菜程序）：总结成"如果…就…"的口诀？
+
+你的任务是把学生写的原始三步，加工成一张清晰、可收藏、可在下次考试时直接调用的"错题手术卡"。
+
+要点：
+- 保留学生的核心洞察，不要替换成你自己的理解。
+- 如果学生写得模糊，你要把它"抛光"到更具体、更可执行的程度，但不要扭曲原意。
+- 口诀一定要是标准的"如果 [触发条件]，就 [动作]"句式。
+- 触发词要精确到题目里会出现的原始字眼（如"中点""直角""对称""最值""整数解"等）。
+- 动作要精确到一步具体的数学操作（如"倍长中线""设未知数列方程""分类讨论"等）。
+- 给这张卡一个简短的标题（不超过12字），方便学生在错题本里翻找。
+- 给这张卡打一个知识点标签（如"全等三角形-辅助线""二次函数-最值""因式分解-十字相乘"），方便归类。
+- 加一句"升华"——用一句话说清这张卡背后的思维习惯，像盖章一样。不要长篇大论。
+
+严格输出 JSON（不要 markdown 代码块）：
+{
+  "title": "不超过12字的卡片标题",
+  "knowledgeTag": "知识点标签，形如'章节-知识点'",
+  "lesion": "抛光后的第一步：具体到概念/公式/辅助线的错因",
+  "trigger": "抛光后的第二步：题目中应当触发正确思路的那个关键词或条件",
+  "recipe": "抛光后的第三步：标准的'如果 X，就 Y'口诀",
+  "insight": "一句话升华：这张卡背后的思维习惯",
+  "qualityScore": 1 到 5 的整数（打磨后这张卡的可用性评分）,
+  "qualityComment": "一句话说明为什么打这个分——学生做得好的地方 + 下次可以更好的地方"
+}
+
+要求：
+- 全程中文。
+- 不要使用"元认知""CER""条件性情绪反应"等心理学术语。
+- insight 要像一句可以贴在课桌上的话，不要说教。
+- 如果学生某一步写得极其空洞（比如只写了"粗心"），在抛光时要尽量利用题目信息补出一个更具体的版本，并在 qualityComment 里诚实指出"原文较模糊，以下版本为教练根据题目补出的参考"。`;
+
+  const userMessage = `错题原文：
+${questionText || '（学生未填写题目）'}
+
+学生写的三步：
+【第一步·定位病灶】${step1 || '（空）'}
+【第二步·寻找线索】${step2 || '（空）'}
+【第三步·炒菜程序】${step3 || '（空）'}
+
+请按 JSON schema 输出这张错题手术卡。`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: getModel(),
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.3,
+      max_tokens: 1200,
+      response_format: { type: 'json_object' }
+    });
+
+    const text = response?.choices?.[0]?.message?.content || '';
+    if (!text) return null;
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch (e) {
+      console.error('[LLM] generateSurgeryCard JSON parse error:', e.message, 'raw:', cleaned.slice(0, 300));
+      return null;
+    }
+  } catch (err) {
+    console.error('[LLM] generateSurgeryCard error:', err?.message || err);
+    return null;
+  }
+}
+
 module.exports = {
   hasApiKey,
   checkLlmHealth,
   getLlmHealth,
   generateCoachReply,
-  generateMetacognitiveSummary
+  generateMetacognitiveSummary,
+  generateSurgeryStepFeedback,
+  generateSurgeryCard
 };

@@ -249,16 +249,21 @@
       if (studentConversations.length === 0) {
         html += '<div style="color:var(--muted);text-align:center;padding:20px;">该学生暂无对话记录</div>';
       } else {
-        html += studentConversations.map(c => `
+        html += studentConversations.map(c => {
+          const mode = c.state?.mode || 'practice';
+          const modeLabel = mode === 'exam' ? '📝 考试' : (mode === 'micro_surgery' ? '🗂️ 错题手术' : '📚 练一题');
+          return `
           <div class="convo-card" data-id="${c.id}">
             <div class="convo-q">${esc(c.questionText || '（未设置题目）')}</div>
             <div class="convo-meta">
+              <span>${modeLabel}</span>
               <span>消息数：${(c.messages || []).length}</span>
               <span>创建：${fmtDate(c.createdAt)}</span>
               <span>更新：${fmtDate(c.updatedAt)}</span>
             </div>
           </div>
-        `).join('');
+        `;
+        }).join('');
       }
 
       el.innerHTML = html;
@@ -295,6 +300,30 @@
       // Summary box
       if (summary) {
         let summaryHtml = '<div class="summary-box"><h4>复盘总结</h4>';
+
+        // ---- Surgery mode: render the surgery card ----
+        if (summary.mode === 'micro_surgery' || summary.surgeryCard) {
+          const card = summary.surgeryCard || {};
+          const steps = summary.steps || {};
+          summaryHtml += `<p><strong>模式：</strong>错题手术</p>`;
+          if (card.title) summaryHtml += `<p><strong>卡片标题：</strong>${esc(card.title)}</p>`;
+          if (card.knowledgeTag) summaryHtml += `<p><strong>知识点标签：</strong>${esc(card.knowledgeTag)}</p>`;
+          if (card.lesion) summaryHtml += `<p><strong>病灶：</strong>${esc(card.lesion)}</p>`;
+          if (card.trigger) summaryHtml += `<p><strong>触发词：</strong>${esc(card.trigger)}</p>`;
+          if (card.recipe) summaryHtml += `<p><strong>炒菜程序：</strong>${esc(card.recipe)}</p>`;
+          if (card.insight) summaryHtml += `<p><strong>升华：</strong>${esc(card.insight)}</p>`;
+          if (card.qualityScore != null) summaryHtml += `<p><strong>打磨评分：</strong>${esc(card.qualityScore)} / 5</p>`;
+          if (card.qualityComment) summaryHtml += `<p><strong>评分说明：</strong>${esc(card.qualityComment)}</p>`;
+          if (steps.step1 || steps.step2 || steps.step3) {
+            summaryHtml += `<p style="margin-top:10px;"><strong>学生原始三步：</strong></p>`;
+            if (steps.step1) summaryHtml += `<p>①定位病灶：${esc(steps.step1)}</p>`;
+            if (steps.step2) summaryHtml += `<p>②寻找线索：${esc(steps.step2)}</p>`;
+            if (steps.step3) summaryHtml += `<p>③炒菜程序：${esc(steps.step3)}</p>`;
+          }
+          summaryHtml += '</div>';
+          html += summaryHtml;
+        } else {
+        // ---- Standard practice/exam summary ----
 
         // Student-facing narrative
         if (summary.studentFacing?.whatHappened) {
@@ -341,6 +370,7 @@
 
         summaryHtml += '</div>';
         html += summaryHtml;
+        }
       }
 
       html += '<h3>完整对话（' + messages.length + ' 条）</h3>';

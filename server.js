@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const path = require('path');
-const { hasApiKey, checkLlmHealth, getLlmHealth, generateCoachReply, generateMetacognitiveSummary } = require('./llm');
+const { hasApiKey, checkLlmHealth, getLlmHealth, generateCoachReply, generateMetacognitiveSummary, generateSurgeryStepFeedback, generateSurgeryCard } = require('./llm');
 const db = require('./db');
 
 const app = express();
@@ -40,7 +40,14 @@ function createInitialState(mode = 'practice') {
     metaInterventionCount: 0,
     examSubmitted: false,
     examFinalAnswer: '',
-    examSubmittedAt: null
+    examSubmittedAt: null,
+    // ---- Micro-surgery mode fields ----
+    surgeryStep1: '',
+    surgeryStep2: '',
+    surgeryStep3: '',
+    surgeryStepFeedback: { 1: null, 2: null, 3: null },
+    surgeryCard: null,
+    surgeryFinalizedAt: null
   };
 }
 
@@ -347,6 +354,21 @@ function buildSystemPrompt(interventionType, state, history, questionText) {
 }
 
 async function buildReply(stateType, state, session, userInput) {
+  // ---- Micro-surgery mode: coach doesn't do free chat, nudge student to the 3-step form ----
+  if (state.mode === 'micro_surgery') {
+    const nudges = [
+      '错题手术模式下，我们按三步走。请在左边填好"定位病灶 / 寻找线索 / 写下炒菜程序"，每一步完成后可以点"让教练打磨"。',
+      '这里不走自由对话。你先把那道错题写在左边题目框里，再按顺序填三步，我会逐步帮你打磨。',
+      '错题手术是个结构化流程，不是聊天。请在左侧按 1-2-3 三步填入你的思考，再点击对应按钮让我看。'
+    ];
+    const content = nudges[Math.floor(Math.random() * nudges.length)];
+    return {
+      role: 'assistant',
+      type: 'SURGERY_NUDGE',
+      content
+    };
+  }
+
   // ---- Exam mode: coach stays silent, no coaching ----
   // Events still fire (tracked for post-exam 复盘), but no hints / no interventions.
   if (state.mode === 'exam' && !state.examSubmitted) {
@@ -712,6 +734,265 @@ app.post('/api/session/:id/submit', async (req, res) => {
   res.json({ ok: true, submittedAt: session.state.examSubmittedAt });
 });
 
+// ============================================================
+// 错题手术 endpoints
+// ============================================================
+
+const SURGERY_STEP_NAMES = {
+  1: '定位病灶',
+  2: '寻找线索',
+  3: '写下炒菜程序'
+};
+
+// Save/refine a single step; optionally ask LLM for feedback.
+// Body: { stepNumber: 1|2|3, stepContent: string, questionText?: string, wantFeedback?: boolean }
+app.post('/api/session/:id/surgery/step', async (req, res) => {
+  const session = SESSIONS.get(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  if (session.state.mode !== 'micro_surgery') {
+    return res.status(400).json({ error: '当前会话不是错题手术模式' });
+  }
+
+  const { stepNumber, stepContent = '', questionText = '', wantFeedback = true } = req.body || {};
+  const n = Number(stepNumber);
+  if (![1, 2, 3].includes(n)) {
+    return res.status(400).json({ error: 'stepNumber 必须为 1、2 或 3' });
+  }
+  const trimmed = String(stepContent || '').trim();
+  if (!trimmed) {
+    return res.status(400).json({ error: '这一步的内容不能为空' });
+  }
+
+  // Update state
+  session.state.currentQuestion = questionText || session.state.currentQuestion || '';
+  session.state[`surgeryStep${n}`] = trimmed;
+
+  // Log step submission in messages (so admin can see the trace)
+  session.messages.push({
+    role: 'user',
+    type: `SURGERY_STEP_${n}`,
+    content: `【第${n}步·${SURGERY_STEP_NAMES[n]}】${trimmed}`,
+    timestamp: Date.now()
+  });
+
+  let feedback = null;
+  if (wantFeedback && getLlmHealth().healthy) {
+    try {
+      feedback = await generateSurgeryStepFeedback({
+        stepNumber: n,
+        stepName: SURGERY_STEP_NAMES[n],
+        stepContent: trimmed,
+        questionText: session.state.currentQuestion,
+        priorSteps: {
+          step1: session.state.surgeryStep1,
+          step2: session.state.surgeryStep2
+        }
+      });
+    } catch (e) {
+      console.error('[Surgery] step feedback failed:', e.message);
+    }
+  }
+
+  // Rule-based fallback feedback so the flow never dies
+  if (!feedback) {
+    feedback = ruleBasedSurgeryFeedback(n, trimmed);
+  }
+
+  session.state.surgeryStepFeedback = session.state.surgeryStepFeedback || { 1: null, 2: null, 3: null };
+  session.state.surgeryStepFeedback[n] = feedback;
+
+  // Log coach feedback in messages
+  if (feedback) {
+    const tag = feedback.verdict === 'good' ? '✅' : '✏️';
+    const body = feedback.verdict === 'good'
+      ? `${tag} ${feedback.comment || '这一步写得够具体。'}`
+      : `${tag} ${feedback.comment || '这一步可以更具体。'}${feedback.suggestion ? `\n建议改为：${feedback.suggestion}` : ''}`;
+    session.messages.push({
+      role: 'assistant',
+      type: `SURGERY_FEEDBACK_${n}`,
+      content: body,
+      timestamp: Date.now()
+    });
+  }
+
+  // Persist
+  if (session.userId && session.userId !== 'guest') {
+    try {
+      await db.saveConversation({
+        id: session.convId,
+        userId: session.userId,
+        sessionId: session.id,
+        questionText: session.state.currentQuestion,
+        messages: session.messages,
+        state: session.state
+      });
+    } catch (e) { console.error('DB save error (surgery step):', e.message); }
+  }
+
+  res.json({
+    ok: true,
+    stepNumber: n,
+    stepName: SURGERY_STEP_NAMES[n],
+    feedback,
+    llmEnabled: getLlmHealth().healthy
+  });
+});
+
+// Finalize: combine three steps into a polished card.
+// Body: { questionText?: string }
+app.post('/api/session/:id/surgery/finalize', async (req, res) => {
+  const session = SESSIONS.get(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  if (session.state.mode !== 'micro_surgery') {
+    return res.status(400).json({ error: '当前会话不是错题手术模式' });
+  }
+
+  const { questionText = '' } = req.body || {};
+  if (questionText) session.state.currentQuestion = questionText;
+
+  const s1 = session.state.surgeryStep1 || '';
+  const s2 = session.state.surgeryStep2 || '';
+  const s3 = session.state.surgeryStep3 || '';
+  if (!s1 || !s2 || !s3) {
+    return res.status(400).json({ error: 'MISSING_STEPS', message: '请先完成三步再生成卡片。' });
+  }
+
+  let card = null;
+  if (getLlmHealth().healthy) {
+    try {
+      card = await generateSurgeryCard({
+        questionText: session.state.currentQuestion,
+        step1: s1,
+        step2: s2,
+        step3: s3
+      });
+    } catch (e) {
+      console.error('[Surgery] card generation failed:', e.message);
+    }
+  }
+
+  if (!card) {
+    // Rule-based fallback: pass the student text through with minimal polishing
+    card = {
+      title: '错题手术卡',
+      knowledgeTag: '（未分类·可手动补充）',
+      lesion: s1,
+      trigger: s2,
+      recipe: s3,
+      insight: '把模糊的直觉，变成清晰的"如果…就…"程序。',
+      qualityScore: 3,
+      qualityComment: '当前未连接 LLM，这张卡是直接收录你的原文。建议连上 LLM 后重新生成以获得打磨。'
+    };
+  }
+
+  card.finalizedAt = Date.now();
+  session.state.surgeryCard = card;
+  session.state.surgeryFinalizedAt = card.finalizedAt;
+
+  // Log into transcript
+  session.messages.push({
+    role: 'assistant',
+    type: 'SURGERY_CARD',
+    content: `🗂️ 错题手术卡已生成：${card.title || '错题手术卡'}\n口诀：${card.recipe || s3}`,
+    timestamp: Date.now()
+  });
+
+  // Persist with summary = { surgeryCard, mode: 'micro_surgery' } so admin sees it
+  const summaryPayload = {
+    mode: 'micro_surgery',
+    surgeryCard: card,
+    steps: {
+      step1: s1,
+      step2: s2,
+      step3: s3
+    },
+    stepFeedback: session.state.surgeryStepFeedback,
+    llmSummary: getLlmHealth().healthy,
+    totalMessages: session.messages.length,
+    timeSpentSec: session.state.timeSpentSec,
+    hintLevel: session.state.hintLevel
+  };
+
+  if (session.userId && session.userId !== 'guest') {
+    try {
+      await db.saveConversation({
+        id: session.convId,
+        userId: session.userId,
+        sessionId: session.id,
+        questionText: session.state.currentQuestion,
+        messages: session.messages,
+        state: session.state,
+        summary: summaryPayload
+      });
+    } catch (e) { console.error('DB save error (surgery finalize):', e.message); }
+  }
+
+  res.json({
+    ok: true,
+    card,
+    llmEnabled: getLlmHealth().healthy
+  });
+});
+
+// Rule-based surgery feedback (fallback when no LLM)
+function ruleBasedSurgeryFeedback(stepNumber, content) {
+  const text = String(content || '').trim();
+
+  if (stepNumber === 1) {
+    // Bad if only vague words like "粗心 / 不熟 / 马虎 / 算错"
+    const vague = ['粗心', '马虎', '不熟', '不会', '算错了', '忘了', '大意'];
+    const onlyVague = vague.some((v) => text.includes(v)) && text.length < 14;
+    if (onlyVague || text.length < 6) {
+      return {
+        verdict: 'needs_work',
+        comment: '这一步还停在"感觉"层面，没有落到具体知识点上。',
+        suggestion: '试着写成："我不知道这里要用 ___（某个具体的公式/定理/辅助线）"——把错误命名到一个你能查到的知识点上。'
+      };
+    }
+    return {
+      verdict: 'good',
+      comment: '不错，已经把错因锁定到具体的概念或方法上了。',
+      suggestion: ''
+    };
+  }
+
+  if (stepNumber === 2) {
+    const vague = ['这种题', '这类题', '看到题目', '知道用', '就该用'];
+    const onlyVague = vague.some((v) => text.includes(v)) && text.length < 16;
+    if (onlyVague || text.length < 6) {
+      return {
+        verdict: 'needs_work',
+        comment: '线索还太笼统，没有锁定题目里某个具体的"触发词"。',
+        suggestion: '试着写成："看到 ___（题目中出现的某个具体词或条件，如"中点""对称""整数解"）就应该想到 ___"。'
+      };
+    }
+    return {
+      verdict: 'good',
+      comment: '很好，锁定到了一个具体的触发词，这正是以后要训练自己看见的那个字眼。',
+      suggestion: ''
+    };
+  }
+
+  // Step 3
+  const hasIfThen = /如果|只要|看到|一旦/.test(text) && /就|则|先|直接/.test(text);
+  if (!hasIfThen || text.length < 10) {
+    return {
+      verdict: 'needs_work',
+      comment: '口诀还没有写成"如果…就…"的标准结构，下次不容易被快速唤起。',
+      suggestion: '改写成固定句式："如果 [触发条件]，就 [具体动作]"——触发条件用原题会出现的词，动作用一步可执行的方法。'
+    };
+  }
+  return {
+    verdict: 'good',
+    comment: '这条口诀已经是"如果…就…"的结构了，下次考试时大脑能被它直接唤起。',
+    suggestion: ''
+  };
+}
+
 app.get('/api/session/:id/summary', async (req, res) => {
   const session = SESSIONS.get(req.params.id);
   if (!session) {
@@ -719,6 +1000,26 @@ app.get('/api/session/:id/summary', async (req, res) => {
   }
   if (session.state.mode === 'exam' && !session.state.examSubmitted) {
     return res.status(403).json({ error: 'EXAM_NOT_SUBMITTED', message: '考试还没结束，请先提交答案再查看复盘。' });
+  }
+  // For micro_surgery mode, return the surgery card as the summary
+  if (session.state.mode === 'micro_surgery') {
+    if (!session.state.surgeryCard) {
+      return res.status(403).json({ error: 'SURGERY_NOT_FINALIZED', message: '请先完成三步并点击"生成手术卡"。' });
+    }
+    return res.json({
+      mode: 'micro_surgery',
+      surgeryCard: session.state.surgeryCard,
+      steps: {
+        step1: session.state.surgeryStep1,
+        step2: session.state.surgeryStep2,
+        step3: session.state.surgeryStep3
+      },
+      stepFeedback: session.state.surgeryStepFeedback,
+      totalMessages: session.messages.length,
+      timeSpentSec: session.state.timeSpentSec,
+      hintLevel: session.state.hintLevel,
+      llmSummary: getLlmHealth().healthy
+    });
   }
   const summary = await buildSummary(session);
   // Persist summary to db
