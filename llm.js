@@ -13,7 +13,7 @@ const OpenAI = require('openai');
 // ------------------------------------------------------------------------
 
 const DEFAULT_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
-const DEFAULT_MODEL = 'GLM-4.7-FlashX';
+const DEFAULT_MODEL = 'glm-4-flash';
 
 function getApiKey() {
   return (process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '').trim();
