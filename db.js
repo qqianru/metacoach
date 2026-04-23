@@ -27,6 +27,29 @@ const conversationSchema = new mongoose.Schema({
   updatedAt:    { type: Number, default: () => Date.now() }
 });
 
+// ============================================================
+// Rate limit schema (per-user daily counter)
+// ============================================================
+const rateLimitSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  date:   { type: String, required: true },  // YYYY-MM-DD
+  count:  { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now, expires: 172800 }  // auto-delete after 48h
+});
+rateLimitSchema.index({ userId: 1, date: 1 }, { unique: true });
+
+// ============================================================
+// Response cache schema (shared AI response cache)
+// ============================================================
+const responseCacheSchema = new mongoose.Schema({
+  questionHash: { type: String, required: true, unique: true, index: true },
+  content:      { type: String, required: true },
+  createdAt:    { type: Date, default: Date.now, expires: 2592000 }  // auto-delete after 30 days
+});
+
+const RateLimit = mongoose.model('RateLimit', rateLimitSchema);
+const ResponseCache = mongoose.model('ResponseCache', responseCacheSchema);
+
 const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 
@@ -204,6 +227,43 @@ async function ensureDefaultTeacher() {
   }
 }
 
+// ============================================================
+// Rate limiting
+// ============================================================
+async function incrementUsageCounter(userId) {
+  const today = new Date().toISOString().slice(0, 10);  // "2026-04-23"
+  const doc = await RateLimit.findOneAndUpdate(
+    { userId, date: today },
+    { $inc: { count: 1 }, $setOnInsert: { createdAt: new Date() } },
+    { upsert: true, new: true }
+  );
+  return doc.count;
+}
+
+async function getUsageCount(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const doc = await RateLimit.findOne({ userId, date: today }).lean();
+  return doc ? doc.count : 0;
+}
+
+// ============================================================
+// Response cache
+// ============================================================
+async function getCachedResponse(questionHash) {
+  const doc = await ResponseCache.findOne({ questionHash }).lean();
+  return doc ? doc.content : null;
+}
+
+async function saveCachedResponse(questionHash, content) {
+  try {
+    await ResponseCache.create({ questionHash, content });
+  } catch (err) {
+    // duplicate key is fine — another request cached it first
+    if (err.code !== 11000) console.error('Cache save error:', err.message);
+  }
+}
+
+
 module.exports = {
   connect,
   ensureDefaultTeacher,
@@ -218,5 +278,11 @@ module.exports = {
   getConversationsByUser,
   getConversation,
   saveConversation,
-  deleteConversation
+  deleteConversation,
+  // NEW: rate limiting
+  incrementUsageCounter,
+  getUsageCount,
+  // NEW: response caching
+  getCachedResponse,
+  saveCachedResponse
 };
