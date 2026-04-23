@@ -18,7 +18,7 @@ const userSchema = new mongoose.Schema({
 
 const conversationSchema = new mongoose.Schema({
   userId:       { type: String, required: true, index: true },
-  sessionId:    { type: String },
+  sessionId:    { type: String, index: true},
   questionText: { type: String, default: '' },
   messages:     { type: Array, default: [] },
   state:        { type: Object, default: {} },
