@@ -203,14 +203,21 @@ async function generateParentCoachReplyStream(messages, onToken, onError) {
       let fullContent = '';
       let usage = {};
 
+      let chunkCount = 0;
       for await (const chunk of stream) {
-        // 正常文本 delta
+        if (chunkCount < 3) {
+          console.log('[ParentLLM-stream] chunk sample:', JSON.stringify(chunk));
+          chunkCount++;
+        }
         const delta = chunk.choices?.[0]?.delta?.content;
+        const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
         if (delta) {
           fullContent += delta;
           if (onToken) onToken(delta);
         }
-        // 最后一帧的 usage 信息
+        if (reasoning) {
+          console.log('[ParentLLM-stream] got reasoning_content (not content):', reasoning.slice(0, 50));
+        }
         if (chunk.usage) {
           usage = chunk.usage;
         }
