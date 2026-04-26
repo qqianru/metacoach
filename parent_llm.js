@@ -103,7 +103,7 @@ async function generateParentCoachReply(messages) {
           model: getParentModel(),
           messages: apiMessages,
           temperature: 0.7,
-          max_tokens: 1200
+          max_tokens: 600
         });
 
         const content = resp.choices?.[0]?.message?.content || '';
@@ -195,7 +195,7 @@ async function generateParentCoachReplyStream(messages, onToken, onError) {
         model: getParentModel(),
         messages: apiMessages,
         temperature: 0.7,
-        max_tokens: 1200,
+        max_tokens: 600,
         stream: true
         // 注意: 去掉了 stream_options.include_usage — GLM 某些 model 不支持会报错
       });
