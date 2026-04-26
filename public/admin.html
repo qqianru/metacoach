@@ -279,9 +279,32 @@
       selectedStudentId = id;
       selectedConvoId = null;
       renderStudentList(document.getElementById('searchInput').value.trim());
-      const data = await api(`/api/admin/students/${id}/conversations`);
+      const student = students.find(s => s.id === id);
+      // 根据 role 决定调用哪个对话接口
+      const endpoint = (student && student.role === 'parent')
+        ? `/api/admin/parents/${id}/conversations`
+        : `/api/admin/students/${id}/conversations`;
+      const data = await api(endpoint);
       studentConversations = data.conversations || [];
       renderStudentDetail();
+    }
+
+    // 10 张场景卡片 id → 中文名映射 (家长 app 用)
+    const PARENT_SCENARIO_TITLES = {
+      'tongtong_quanban_yilun': '彤彤·人际过敏',
+      'haohao_shuxue_hengdun': '浩浩·学习障碍',
+      'xiaoyaC_wanmei_mojing': '小雅C·完美主义',
+      'wangpeng_baibanlan': '王鹏·摆烂泛化',
+      'xiaolei_xiaomenkou': '小磊·拒学躯体化',
+      'xiaoyu_shentongbianmotou': '小雨·性格急转',
+      'haoyu_xuexiaoguai_zaijiazha': '浩宇·亲子关系',
+      'haoran_yuanshengjiating': '浩然·伪心理学',
+      'linfeifei_jiatinghuyi': '林菲菲·家庭沟通',
+      'zhangbaoshan_aishenru': '张宝山·边界'
+    };
+    function scenarioTitle(scenarioId) {
+      if (!scenarioId) return '自定义场景';
+      return PARENT_SCENARIO_TITLES[scenarioId] || scenarioId;
     }
 
     function renderStudentDetail() {
@@ -309,7 +332,26 @@
       `;
 
       if (studentConversations.length === 0) {
-        html += '<div style="color:var(--muted);text-align:center;padding:20px;">该学生暂无对话记录</div>';
+        const emptyText = student.role === 'parent' ? '该家长暂无对话记录' : '该学生暂无对话记录';
+        html += `<div style="color:var(--muted);text-align:center;padding:20px;">${emptyText}</div>`;
+      } else if (student.role === 'parent') {
+        // 家长对话: 用场景名而不是题目
+        html += studentConversations.map(c => {
+          const title = scenarioTitle(c.scenarioId);
+          const expertBadge = c.expertRequested
+            ? '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:8px;font-size:11px;margin-left:8px;">专家已请求</span>'
+            : '';
+          return `
+          <div class="convo-card" data-id="${c.id}">
+            <div class="convo-q">🎯 ${esc(title)}${expertBadge}</div>
+            <div class="convo-meta">
+              <span>消息数：${(c.messages || []).length}</span>
+              <span>创建：${fmtDate(c.createdAt)}</span>
+              <span>更新：${fmtDate(c.updatedAt)}</span>
+            </div>
+          </div>
+        `;
+        }).join('');
       } else {
         html += studentConversations.map(c => {
           const mode = c.state?.mode || 'practice';
@@ -341,6 +383,8 @@
     async function renderConvoDetail() {
       const convo = studentConversations.find(c => c.id === selectedConvoId);
       if (!convo) return;
+      const student = students.find(s => s.id === selectedStudentId);
+      const isParent = student && student.role === 'parent';
 
       const el = document.getElementById('detailContent');
       const messages = convo.messages || [];
@@ -355,9 +399,19 @@
             ${fmtDate(convo.createdAt)} ~ ${fmtDate(convo.updatedAt)}
           </div>
         </div>
-        <h3>题目</h3>
-        <p style="font-size:14px;color:var(--muted);margin:0 0 16px;">${esc(convo.questionText || '未设置题目')}</p>
       `;
+
+      if (isParent) {
+        // 家长对话: 显示场景标题, 没有"题目"字段
+        const title = scenarioTitle(convo.scenarioId);
+        html += `<h3>场景</h3><p style="font-size:14px;color:var(--muted);margin:0 0 16px;">🎯 ${esc(title)}</p>`;
+        if (convo.expertRequested) {
+          html += `<div style="background:#fef3c7;border:1px solid #fcd34d;padding:10px;border-radius:8px;margin-bottom:16px;color:#92400e;font-size:13px;">⚠️ 此对话已触发专家转介请求</div>`;
+        }
+      } else {
+        // 学生: 显示题目
+        html += `<h3>题目</h3><p style="font-size:14px;color:var(--muted);margin:0 0 16px;">${esc(convo.questionText || '未设置题目')}</p>`;
+      }
 
       // Summary box
       if (summary) {
@@ -439,7 +493,9 @@
       html += '<div class="msg-list">';
       messages.forEach(m => {
         const role = m.role || 'user';
-        const label = role === 'user' ? '学生' : '王鹰教授';
+        const label = role === 'user'
+          ? (isParent ? '家长' : '学生')
+          : (isParent ? '家长教练' : '王鹰教授');
         const typeTag = m.type ? ` · ${m.type}` : '';
         const time = m.timestamp ? fmtTime(m.timestamp) : '';
         html += `

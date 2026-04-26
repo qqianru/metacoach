@@ -1535,6 +1535,12 @@ app.get('/api/admin/students/:id/conversations', requireTeacher, async (req, res
   res.json({ conversations: convos });
 });
 
+// ★ Get all parent conversations for a parent user (admin only)
+app.get('/api/admin/parents/:id/conversations', requireTeacher, async (req, res) => {
+  const convos = await db.getParentConversationsByUser(req.params.id);
+  res.json({ conversations: convos });
+});
+
 // Get a single conversation detail
 app.get('/api/admin/conversations/:id', requireTeacher, async (req, res) => {
   const convo = await db.getConversation(req.params.id);
