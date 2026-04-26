@@ -989,11 +989,15 @@ app.post('/api/chat/stream', async (req, res) => {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
+  // 关键: 立刻 flush headers 绕过反向代理 buffer
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
   res.write(': stream-start\n\n');
+  res.write(': ' + ' '.repeat(2048) + '\n\n');  // padding 强制 flush
 
   function sendEvent(event, data) {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
   }
 
   const stateSummary = {
@@ -1630,12 +1634,18 @@ app.post('/api/parents/chat/stream', requireParent, async (req, res) => {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'  // 禁用 nginx 缓冲
   });
-  res.write(': stream-start\n\n');  // SSE comment, 立刻 flush 头部
+  // 关键: 强制立刻把 headers 推过去 (绕过 Render 反向代理 buffering)
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.write(': stream-start\n\n');
+  // 用 padding 把第一帧填到 ≥4KB,强制反向代理立刻 flush
+  res.write(': ' + ' '.repeat(2048) + '\n\n');
 
   // SSE 帮助函数
   function sendEvent(event, data) {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
+    // 每个 event 后强制 flush — 绕过反向代理 buffer
+    if (typeof res.flush === 'function') res.flush();
   }
 
   // 调用流式 LLM

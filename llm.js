@@ -159,8 +159,8 @@ async function generateCoachReplyStream({ systemPrompt, userMessage, context }, 
         ],
         temperature: 0.6,
         max_tokens: 800,
-        stream: true,
-        stream_options: { include_usage: true }
+        stream: true
+        // 去掉 stream_options.include_usage 提高 GLM 兼容性
       });
 
       let fullContent = '';
