@@ -106,6 +106,39 @@ function detectWithdrawal(text) {
   ]);
 }
 
+// 检测学生在问 app 不支持的功能 (拍照、上传图片、语音等)
+// 命中就用硬编码 reply 直接答,不走 LLM (避免 LLM 瞎编步骤)
+function detectUnsupportedFeatureAsk(text) {
+  if (!text) return null;
+  const t = String(text);
+
+  // 图片相关 — 这是最常见的
+  const photoPatterns = [
+    /拍照/, /照片/, /图片/, /上传图/, /上传文件/, /上传/, /发图/, /发照片/,
+    /相册/, /相机/, /扫描/, /图像/, /附件/
+  ];
+  if (photoPatterns.some(p => p.test(t))) {
+    return 'photo';
+  }
+
+  // 语音
+  if (/语音|录音|说话给你|麦克风|voice/i.test(t)) {
+    return 'voice';
+  }
+
+  // 视频
+  if (/视频|video|录像/i.test(t)) {
+    return 'video';
+  }
+
+  // 分享
+  if (/分享给|发给我朋友|发给.*同学|share/i.test(t)) {
+    return 'share';
+  }
+
+  return null;
+}
+
 function detectFirstTurnAmbiguous(text, state, history) {
   // 仅在第一次发言时触发,且消息很短并模糊
   // history 是 session.messages — 当前 user 消息已经在里面了,所以
@@ -189,7 +222,10 @@ function classifyState(state, userInput, history) {
   if (state.conversationMode === 'OFF_TOPIC') return 'OFF_TOPIC';
   if (state.conversationMode === 'FINISHED') return 'FINISHED';
   if (state.conversationMode === 'REVIEW') return 'REVIEW';
-  // 优先级最高:第一次说"我不会/不知道怎么用"等模糊话语,先问清楚是软件还是数学
+  // 优先级最高 (在 NEEDS_DISAMBIGUATION 之前): 学生问不支持的功能
+  // 原因: 防止 LLM 瞎编 "看右上角三个点" 之类的虚假步骤
+  if (detectUnsupportedFeatureAsk(userInput)) return 'UNSUPPORTED_FEATURE';
+  // 优先级次高:第一次说"我不会/不知道怎么用"等模糊话语,先问清楚是软件还是数学
   if (detectFirstTurnAmbiguous(userInput, state, history)) return 'NEEDS_DISAMBIGUATION';
   if (detectWithdrawal(userInput)) return 'WITHDRAWAL';
   if (state.noProgressTurns >= 2) return 'META_INTERVENTION';
@@ -343,6 +379,23 @@ function buildRuleReply(stateType, state, payload) {
         type: 'NEEDS_DISAMBIGUATION',
         content: '你说不会，是不会做这道题，还是不太清楚这个软件怎么用？告诉我哪一个，我马上帮你。\n\n（点上面"我不会用软件"或者"不会做题"，或者直接打字告诉我也行。）'
       };
+    case 'UNSUPPORTED_FEATURE': {
+      // 用 detectUnsupportedFeatureAsk 把具体类型分出来
+      const feature = detectUnsupportedFeatureAsk(payload.userInput || '');
+      let content;
+      if (feature === 'photo') {
+        content = '这个版本暂时不支持拍照或上传图片。把题目用文字打到左边的"题目"框里就可以——如果题目里有图（比如几何图形），用文字描述一下也行，比如"三角形 ABC，D 是 BC 的中点"。\n\n打好了告诉我，我们一起看。';
+      } else if (feature === 'voice') {
+        content = '这个版本暂时不支持语音输入。请用文字告诉我你的题目和想法，我会陪你一步一步做。';
+      } else if (feature === 'video') {
+        content = '这个版本暂时不支持视频。我们就用文字聊——你把题目和卡住的地方告诉我，效果一样。';
+      } else if (feature === 'share') {
+        content = '这个版本暂时不支持把对话分享给别人。如果你想保存做题记录，可以等做完看"复盘"，或者直接复制聊天里的文字。';
+      } else {
+        content = '这个功能我们这个版本暂时不支持。把你想做的事用文字告诉我，我们一起想办法。';
+      }
+      return { role: 'assistant', type: 'UNSUPPORTED_FEATURE', content };
+    }
     case 'STUCK': {
       const strategy = selectStrategy(stateType, state);
       return {
@@ -368,6 +421,30 @@ function buildSystemPrompt(interventionType, state, history, questionText) {
     'You are an AI metacognitive learning coach guided by Professor Wang Ying (王鹰教授) pedagogical approach.',
     'Your goal is NOT to immediately solve the problem.',
     'You help the student regulate thinking, stay calm, and make better decisions while solving problems.',
+    '',
+    '== CRITICAL: APP CAPABILITIES ==',
+    'You must know exactly what features this app has and does NOT have. NEVER invent or hallucinate features.',
+    '',
+    'The 茹意宝 student app supports ONLY:',
+    '- A "题目" (question) textarea at the top-left where the student types or pastes a math problem AS TEXT',
+    '- A chat panel on the right where the student and coach talk in TEXT',
+    '- Three modes: 练习 (practice), 考试 (exam), 错题手术 (micro-surgery for analyzing past mistakes)',
+    '- A 复盘 (summary) feature that shows a metacognitive review after the session',
+    '',
+    'The app does NOT support, and you must NEVER suggest these:',
+    '- ❌ Photo upload / image upload / camera / 拍照 / 上传图片 / 上传照片 / 上传文件',
+    '- ❌ Voice messages / audio / 语音输入',
+    '- ❌ Video / screen sharing',
+    '- ❌ File attachments of any kind',
+    '- ❌ Sharing the conversation with other people',
+    '- ❌ Drawing / handwriting input',
+    '',
+    'If a student asks "can I take a photo / upload an image / 拍照 / 上传图片 / 上传文件" or anything similar:',
+    '  Respond clearly: "这个版本暂时不支持图片上传，你把题目用文字打进左边的题目框就可以。如果题目里有图（比如几何图形），可以用文字描述一下，比如\'三角形 ABC, D 是 BC 的中点\'。我们一起来看。"',
+    '  Then immediately bring focus back to the math problem. Do NOT make up instructions like "look for the upload button" or "tap the three dots" — these features do not exist.',
+    '',
+    'If you are uncertain whether the app supports something, default to: "这个我不太确定我们这个版本支持不支持，你试试用文字把它告诉我，我们一起看。" Never invent steps.',
+    '',
     `Current intervention type: ${interventionType}`,
     `Current conversation mode: ${state.conversationMode}`,
     `Current hint level: ${state.hintLevel}`,
@@ -435,11 +512,11 @@ async function buildReply(stateType, state, session, userInput) {
     };
   }
 
- const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion });
+ const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion, userInput });
 
-  // 对于澄清类的状态(消歧),回复内容固定且简单,不走 LLM
+  // 对于不支持的功能 / 澄清类状态, 回复内容固定且简单,不走 LLM
   // 这样保证 100% 触发,而且 0 延迟,0 token 成本
-  if (stateType === 'NEEDS_DISAMBIGUATION') {
+  if (stateType === 'NEEDS_DISAMBIGUATION' || stateType === 'UNSUPPORTED_FEATURE') {
     return fallback;
   }
 
@@ -532,10 +609,10 @@ async function buildReplyStreamable(stateType, state, session, userInput) {
     return { stream: false, reply: { role: 'assistant', type: 'EXAM_SILENT', content } };
   }
 
-  const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion });
+  const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion, userInput });
 
-  // ---- 澄清问题: 硬编码 ----
-  if (stateType === 'NEEDS_DISAMBIGUATION') {
+  // ---- 不支持的功能 / 澄清问题: 硬编码 ----
+  if (stateType === 'NEEDS_DISAMBIGUATION' || stateType === 'UNSUPPORTED_FEATURE') {
     return { stream: false, reply: fallback };
   }
 
