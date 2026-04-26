@@ -105,7 +105,7 @@
   <div class="admin-shell">
     <div class="admin-topbar">
       <div>
-        <h1>学生管理</h1>
+        <h1>管理后台</h1>
       </div>
       <div class="right">
         <a href="/" style="text-decoration:none"><button class="secondary">返回练习</button></a>
@@ -114,27 +114,60 @@
       </div>
     </div>
 
-    <div class="admin-grid">
-      <!-- Left: student list -->
-      <div class="panel student-list-panel">
-        <h2>学生列表</h2>
-        <div class="add-student-row">
-          <input type="text" id="newStudentName" placeholder="用户名" />
-          <input type="text" id="newStudentDisplay" placeholder="显示名" style="max-width:120px;" />
-          <button id="addStudentBtn">添加</button>
-        </div>
-        <div class="search-box">
-          <input type="text" id="searchInput" placeholder="搜索学生…" />
-        </div>
-        <div id="studentList"></div>
-      </div>
+    <!-- Top-level tab switcher -->
+    <div class="tab-nav" style="margin: 0 0 16px;">
+      <button id="adminTabStudents" class="active">学生 (题目陪练)</button>
+      <button id="adminTabExpertRequests">专家转介请求 <span id="expertRequestBadge" style="background:#ef4444;color:#fff;border-radius:8px;padding:1px 6px;font-size:11px;display:none;margin-left:4px;">0</span></button>
+    </div>
 
-      <!-- Right: detail -->
-      <div class="panel detail-panel" id="detailPanel">
-        <div class="detail-empty" id="detailEmpty">
-          选择左边一个学生查看对话记录
+    <!-- Tab pane: students (the existing UI) -->
+    <div id="adminPaneStudents">
+      <div class="admin-grid">
+        <!-- Left: student list -->
+        <div class="panel student-list-panel">
+          <h2>学生列表</h2>
+          <div class="add-student-row">
+            <input type="text" id="newStudentName" placeholder="用户名" />
+            <input type="text" id="newStudentDisplay" placeholder="显示名" style="max-width:120px;" />
+            <button id="addStudentBtn">添加</button>
+          </div>
+          <div class="search-box">
+            <input type="text" id="searchInput" placeholder="搜索学生…" />
+          </div>
+          <div id="studentList"></div>
         </div>
-        <div id="detailContent" style="display:none;"></div>
+
+        <!-- Right: detail -->
+        <div class="panel detail-panel" id="detailPanel">
+          <div class="detail-empty" id="detailEmpty">
+            选择左边一个学生查看对话记录
+          </div>
+          <div id="detailContent" style="display:none;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab pane: expert requests (NEW) -->
+    <div id="adminPaneExpertRequests" style="display:none;">
+      <div class="admin-grid">
+        <!-- Left: list of expert requests -->
+        <div class="panel student-list-panel">
+          <h2>专家转介请求</h2>
+          <div style="display:flex;gap:6px;margin-bottom:12px;font-size:12px;">
+            <button class="secondary" data-filter="pending" id="erFilterPending" style="font-size:12px;padding:6px 10px;">未联系</button>
+            <button class="secondary" data-filter="contacted" id="erFilterContacted" style="font-size:12px;padding:6px 10px;">已联系</button>
+            <button class="secondary" data-filter="all" id="erFilterAll" style="font-size:12px;padding:6px 10px;">全部</button>
+          </div>
+          <div id="expertRequestList">载入中...</div>
+        </div>
+
+        <!-- Right: detail -->
+        <div class="panel detail-panel" id="erDetailPanel">
+          <div class="detail-empty" id="erDetailEmpty">
+            选择左边一条专家转介请求查看完整对话
+          </div>
+          <div id="erDetailContent" style="display:none;"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -424,6 +457,202 @@
 
     // ---- Init ----
     loadStudents();
+
+    // ============================================================
+    // ★ Expert request tab (NEW)
+    // ============================================================
+
+    let erCurrentFilter = 'pending';  // pending / contacted / all
+    let erRequests = [];
+
+    function setAdminTab(which) {
+      const tabStudents = document.getElementById('adminTabStudents');
+      const tabExperts = document.getElementById('adminTabExpertRequests');
+      const paneStudents = document.getElementById('adminPaneStudents');
+      const paneExperts = document.getElementById('adminPaneExpertRequests');
+      if (which === 'students') {
+        tabStudents.classList.add('active');
+        tabExperts.classList.remove('active');
+        paneStudents.style.display = '';
+        paneExperts.style.display = 'none';
+      } else {
+        tabStudents.classList.remove('active');
+        tabExperts.classList.add('active');
+        paneStudents.style.display = 'none';
+        paneExperts.style.display = '';
+        loadExpertRequests();
+      }
+    }
+
+    document.getElementById('adminTabStudents').addEventListener('click', () => setAdminTab('students'));
+    document.getElementById('adminTabExpertRequests').addEventListener('click', () => setAdminTab('experts'));
+
+    async function loadExpertRequests() {
+      const listEl = document.getElementById('expertRequestList');
+      listEl.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:12px;">载入中...</div>';
+      const params = erCurrentFilter === 'all' ? '' : '?status=' + erCurrentFilter;
+      const data = await api('/api/admin/expert-requests' + params);
+      if (data.error) {
+        listEl.innerHTML = '<div style="color:#c33;padding:12px;">' + esc(data.error) + '</div>';
+        return;
+      }
+      erRequests = data.requests || [];
+      renderExpertRequestList();
+      updateExpertRequestBadge();
+    }
+
+    async function updateExpertRequestBadge() {
+      // Always show pending count regardless of current filter
+      const data = await api('/api/admin/expert-requests?status=pending');
+      const count = (data.requests || []).length;
+      const badge = document.getElementById('expertRequestBadge');
+      if (count > 0) {
+        badge.textContent = count;
+        badge.style.display = '';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    function renderExpertRequestList() {
+      const listEl = document.getElementById('expertRequestList');
+      if (erRequests.length === 0) {
+        listEl.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:24px;text-align:center;">没有' +
+          (erCurrentFilter === 'pending' ? '未处理的' : erCurrentFilter === 'contacted' ? '已联系的' : '') + '请求</div>';
+        return;
+      }
+      listEl.innerHTML = '';
+      for (const r of erRequests) {
+        const item = document.createElement('div');
+        item.className = 'student-item';
+        const urgencyTag = r.urgency === 'severe'
+          ? '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600;margin-right:6px;">紧急</span>'
+          : '<span style="background:var(--primary-soft);color:var(--primary);padding:2px 8px;border-radius:8px;font-size:11px;margin-right:6px;">非紧急</span>';
+        const statusTag = r.status === 'contacted'
+          ? '<span style="color:#10b981;font-size:11px;">✓ 已联系</span>'
+          : '<span style="color:var(--muted);font-size:11px;">未联系</span>';
+        item.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:8px;">
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:600;font-size:14px;">${urgencyTag}${esc(r.displayName || r.username)}</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:4px;">
+                📞 ${esc(r.parentPhone || '(未留电话)')}
+              </div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px;">
+                ${fmtDate(r.createdAt)} ${fmtTime(r.createdAt)}
+              </div>
+            </div>
+            <div style="text-align:right;font-size:11px;">${statusTag}</div>
+          </div>
+        `;
+        item.addEventListener('click', () => loadExpertRequestDetail(r.id));
+        listEl.appendChild(item);
+      }
+    }
+
+    async function loadExpertRequestDetail(id) {
+      document.getElementById('erDetailEmpty').style.display = 'none';
+      const cEl = document.getElementById('erDetailContent');
+      cEl.style.display = '';
+      cEl.innerHTML = '<div style="color:var(--muted);">载入中...</div>';
+      const data = await api('/api/admin/expert-requests/' + id);
+      if (data.error) {
+        cEl.innerHTML = '<div style="color:#c33;">' + esc(data.error) + '</div>';
+        return;
+      }
+      const r = data.request;
+      const convo = data.conversation;
+      const urgencyTag = r.urgency === 'severe'
+        ? '<span style="background:#fee2e2;color:#991b1b;padding:3px 10px;border-radius:8px;font-size:12px;font-weight:600;">紧急 (含自伤/重度信号)</span>'
+        : '<span style="background:var(--primary-soft);color:var(--primary);padding:3px 10px;border-radius:8px;font-size:12px;">非紧急 (家长主动请求)</span>';
+
+      let messagesHtml = '';
+      if (convo && convo.messages) {
+        for (const m of convo.messages) {
+          const bg = m.role === 'user' ? 'var(--user)' : 'var(--assistant)';
+          const label = m.role === 'user' ? '👤 家长' : '🤖 教练';
+          messagesHtml += `
+            <div style="background:${bg};padding:10px 14px;border-radius:10px;margin-bottom:10px;border:1px solid var(--line);">
+              <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">${label}</div>
+              <div style="font-size:14px;line-height:1.6;white-space:pre-wrap;">${esc(m.content)}</div>
+            </div>
+          `;
+        }
+      }
+
+      cEl.innerHTML = `
+        <div style="margin-bottom:18px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <h3 style="margin:0;font-size:18px;">${esc(r.displayName || r.username)}</h3>
+            ${urgencyTag}
+          </div>
+          <div style="font-size:13px;color:var(--muted);">
+            📞 联系电话: <strong style="color:var(--text);">${esc(r.parentPhone || '(家长未留电话)')}</strong><br>
+            🕐 提交时间: ${fmtDate(r.createdAt)} ${fmtTime(r.createdAt)}<br>
+            📊 状态: ${r.status === 'contacted' ? '✓ 已联系 ' + fmtDate(r.contactedAt) : '未联系'}
+          </div>
+        </div>
+
+        ${r.conversationSummary ? `
+          <div style="background:#fffbeb;border:1px solid #fbbf24;padding:12px 14px;border-radius:10px;margin-bottom:18px;">
+            <div style="font-size:11px;color:#92400e;font-weight:600;margin-bottom:4px;">📝 对话摘要 (AI 生成)</div>
+            <div style="font-size:13px;line-height:1.6;color:#78350f;">${esc(r.conversationSummary)}</div>
+          </div>
+        ` : ''}
+
+        <div style="margin-bottom:18px;">
+          <h4 style="margin:0 0 10px;font-size:14px;color:var(--muted);">完整对话:</h4>
+          ${messagesHtml || '<div style="color:var(--muted);">(无对话记录)</div>'}
+        </div>
+
+        <div style="border-top:1px solid var(--line);padding-top:16px;">
+          <h4 style="margin:0 0 10px;font-size:14px;">后台员工备注</h4>
+          <textarea id="erNotes" rows="3" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-family:inherit;font-size:13px;">${esc(r.notes || '')}</textarea>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            ${r.status === 'pending' ? `<button id="erMarkContactedBtn" style="background:#10b981;color:#fff;">✓ 标记为已联系</button>` : ''}
+            <button id="erSaveNotesBtn" class="secondary">保存备注</button>
+          </div>
+        </div>
+      `;
+
+      const markBtn = document.getElementById('erMarkContactedBtn');
+      if (markBtn) {
+        markBtn.addEventListener('click', async () => {
+          const notes = document.getElementById('erNotes').value.trim();
+          await api('/api/admin/expert-requests/' + id + '/update', {
+            method: 'POST',
+            body: JSON.stringify({ status: 'contacted', notes })
+          });
+          loadExpertRequests();
+          loadExpertRequestDetail(id);
+        });
+      }
+      document.getElementById('erSaveNotesBtn').addEventListener('click', async () => {
+        const notes = document.getElementById('erNotes').value.trim();
+        const result = await api('/api/admin/expert-requests/' + id + '/update', {
+          method: 'POST',
+          body: JSON.stringify({ notes })
+        });
+        if (result.error) alert(result.error); else alert('已保存');
+      });
+    }
+
+    // ---- Filter buttons ----
+    function setErFilter(filter) {
+      erCurrentFilter = filter;
+      document.querySelectorAll('[data-filter]').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.querySelector(`[data-filter="${filter}"]`);
+      if (activeBtn) activeBtn.classList.add('active');
+      loadExpertRequests();
+    }
+    document.getElementById('erFilterPending').addEventListener('click', () => setErFilter('pending'));
+    document.getElementById('erFilterContacted').addEventListener('click', () => setErFilter('contacted'));
+    document.getElementById('erFilterAll').addEventListener('click', () => setErFilter('all'));
+
+    // Show pending badge on page load
+    updateExpertRequestBadge();
+    // Refresh badge every 60s
+    setInterval(updateExpertRequestBadge, 60000);
   </script>
 </body>
 </html>

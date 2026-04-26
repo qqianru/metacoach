@@ -3,6 +3,8 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const { hasApiKey, checkLlmHealth, getLlmHealth, generateCoachReply, generateMetacognitiveSummary, generateSurgeryStepFeedback, generateSurgeryCard } = require('./llm');
+const parentLlm = require('./parent_llm');
+const scenarios = require('./server/scenarios');
 const db = require('./db');
 
 // Concurrency queue for LLM calls
@@ -104,6 +106,24 @@ function detectWithdrawal(text) {
   ]);
 }
 
+function detectFirstTurnAmbiguous(text, state, history) {
+  // 仅在第一次发言时触发,且消息很短并模糊
+  // history 是 session.messages — 当前 user 消息已经在里面了,所以
+  // "已经聊过" 的判断 = user 消息数 > 1
+  const userMessageCount = (history || []).filter(m => m.role === 'user').length;
+  if (userMessageCount > 1) return false;
+  if (state && state.askedPrompts && state.askedPrompts.length > 0) return false;
+  const t = (text || '').trim();
+  if (t.length > 25) return false;  // 长消息一般是真问题描述,不是模糊请求
+  // 这些模糊词组,需要先问清楚是想要软件帮助还是数学帮助
+  const ambiguousPhrases = [
+    '我不会', '不会用', '我不知道', '不知道怎么', '怎么开始', '怎么用',
+    '我不会开始', '不会用软件', '不知道', '怎么操作', '这个怎么用',
+    '怎么弄', '我不懂', '不懂'
+  ];
+  return ambiguousPhrases.some(p => t.includes(p));
+}
+
 function detectStuck(text) {
   return includesAny(text, [
     '不会', '没思路', '不知道怎么开始', '卡住', '不会做', '不知道', '怎么求', '怎么做'
@@ -165,10 +185,12 @@ function detectConversationMode(userInput, state) {
   return 'SOLVING';
 }
 
-function classifyState(state, userInput) {
+function classifyState(state, userInput, history) {
   if (state.conversationMode === 'OFF_TOPIC') return 'OFF_TOPIC';
   if (state.conversationMode === 'FINISHED') return 'FINISHED';
   if (state.conversationMode === 'REVIEW') return 'REVIEW';
+  // 优先级最高:第一次说"我不会/不知道怎么用"等模糊话语,先问清楚是软件还是数学
+  if (detectFirstTurnAmbiguous(userInput, state, history)) return 'NEEDS_DISAMBIGUATION';
   if (detectWithdrawal(userInput)) return 'WITHDRAWAL';
   if (state.noProgressTurns >= 2) return 'META_INTERVENTION';
   if (detectEmotion(userInput)) return 'EMOTION';
@@ -315,6 +337,12 @@ function buildRuleReply(stateType, state, payload) {
           '先别重做整题。你只检查最后一步，看看是不是符号或常数项出了问题。'
         ])
       };
+    case 'NEEDS_DISAMBIGUATION':
+      return {
+        role: 'assistant',
+        type: 'NEEDS_DISAMBIGUATION',
+        content: '你说不会，是不会做这道题，还是不太清楚这个软件怎么用？告诉我哪一个，我马上帮你。\n\n（点上面"我不会用软件"或者"不会做题"，或者直接打字告诉我也行。）'
+      };
     case 'STUCK': {
       const strategy = selectStrategy(stateType, state);
       return {
@@ -344,9 +372,13 @@ function buildSystemPrompt(interventionType, state, history, questionText) {
     `Current conversation mode: ${state.conversationMode}`,
     `Current hint level: ${state.hintLevel}`,
     `Question snippet: ${getQuestionSnippet(questionText)}`,
+    `Total turns so far: ${history.length}`,
     '',
     'Rules:',
     '- Keep the reply short, calm, and supportive.',
+    '- DISAMBIGUATION RULE (highest priority, applies in early turns): If this is the first user message in the session AND the message is short and ambiguous about whether they need help with the math vs. help with how to use this app — examples: "我不会", "我不知道怎么用", "怎么开始", "不知道", "怎么做", "我不会用" — do NOT assume which one they mean. Briefly ask them to clarify with a warm one-line question, like: "你说不会，是不会做这道题，还是不太清楚这个软件怎么用？告诉我哪一个，我马上帮你。" Then wait for their answer.',
+    '- HOW-TO-USE RULE: If the student says they need help using the app (e.g. clarifies "我不会用软件", "怎么操作", "这个怎么用"), explain in plain words: (1) the题目 textbox at the top is where to paste a math problem; (2) the chat panel is where you and the coach talk it through together; (3) the coach will not give the answer directly — coach will ask questions to help you find it; (4) if you get stuck, say so directly ("我卡住了" / "我没思路") and the coach will help; (5) you can ask "可以再说简单一点吗" any time. Keep this explanation under 5 short sentences. Then ask: "想试试看吗？告诉我你卡在哪一步。"',
+    '- Once disambiguation is resolved (or if the message is clearly about the math problem), continue with the normal coaching rules below.',
     '- Do not repeat the same question that has already been asked.',
     '- If the mode is FINISHED, do not continue teaching new steps; shift to checking or verifying.',
     '- If the mode is REVIEW, ask the student to explain the method or verify the result.',
@@ -404,6 +436,13 @@ async function buildReply(stateType, state, session, userInput) {
   }
 
  const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion });
+
+  // 对于澄清类的状态(消歧),回复内容固定且简单,不走 LLM
+  // 这样保证 100% 触发,而且 0 延迟,0 token 成本
+  if (stateType === 'NEEDS_DISAMBIGUATION') {
+    return fallback;
+  }
+
   const llmHealth = getLlmHealth();
   if (!llmHealth.healthy) {
     return fallback;
@@ -462,6 +501,106 @@ async function buildReply(stateType, state, session, userInput) {
     return fallback;
   }
 }
+
+/**
+ * 流式版本的 buildReply.
+ *  - 对于硬编码/规则 reply,立即返回 { stream: false, reply }
+ *  - 对于 LLM-bound reply,返回 { stream: true, run: async (onToken) => {fullReply} }
+ *
+ * caller (路由层) 决定怎么把这两种情况推给浏览器:
+ *  - 非流式 reply 用单条 SSE event 立即推过去
+ *  - 流式 reply 调用 run(onToken),期间逐 token 推
+ */
+async function buildReplyStreamable(stateType, state, session, userInput) {
+  const { generateCoachReplyStream } = require('./llm');
+
+  // ---- Micro-surgery mode: 硬编码 ----
+  if (state.mode === 'micro_surgery') {
+    const nudges = [
+      '错题手术模式下，我们按三步走。请在左边填好"定位病灶 / 寻找线索 / 写下炒菜程序"，每一步完成后可以点"让教练打磨"。',
+      '这里不走自由对话。你先把那道错题写在左边题目框里，再按顺序填三步，我会逐步帮你打磨。',
+      '错题手术是个结构化流程，不是聊天。请在左侧按 1-2-3 三步填入你的思考，再点击对应按钮让我看。'
+    ];
+    const content = nudges[Math.floor(Math.random() * nudges.length)];
+    return { stream: false, reply: { role: 'assistant', type: 'SURGERY_NUDGE', content } };
+  }
+
+  // ---- Exam mode: 硬编码 ----
+  if (state.mode === 'exam' && !state.examSubmitted) {
+    const acks = ['好的，继续。', '收到。', '记下了，继续写。', '嗯，继续你的思路。', '好，继续。'];
+    const content = acks[Math.floor(Math.random() * acks.length)];
+    return { stream: false, reply: { role: 'assistant', type: 'EXAM_SILENT', content } };
+  }
+
+  const fallback = buildRuleReply(stateType, state, { questionText: state.currentQuestion });
+
+  // ---- 澄清问题: 硬编码 ----
+  if (stateType === 'NEEDS_DISAMBIGUATION') {
+    return { stream: false, reply: fallback };
+  }
+
+  const llmHealth = getLlmHealth();
+  if (!llmHealth.healthy) {
+    return { stream: false, reply: fallback };
+  }
+
+  // ---- 缓存命中: 硬编码 ----
+  const cacheableStates = ['NORMAL', 'STUCK'];
+  const isCacheable = cacheableStates.includes(stateType) && state.hintLevel === 0;
+  let questionHash = null;
+  if (isCacheable) {
+    questionHash = hashQuestion(state.currentQuestion, userInput);
+    try {
+      const cached = await db.getCachedResponse(questionHash);
+      if (cached) {
+        state.askedPrompts.push(cached);
+        if (state.askedPrompts.length > 24) state.askedPrompts.shift();
+        return { stream: false, reply: { role: 'assistant', type: stateType, content: cached } };
+      }
+    } catch (e) {
+      console.error('Cache lookup failed:', e.message);
+    }
+  }
+
+  // ---- 真的需要走 LLM: 返回一个能 stream 的 runner ----
+  const systemPrompt = buildSystemPrompt(stateType, state, session.messages, state.currentQuestion);
+  const context = {
+    state,
+    questionText: state.currentQuestion,
+    lastStateType: state.lastStateType,
+    lastStrategy: state.lastStrategy,
+    recentMessages: session.messages.slice(-6)
+  };
+
+  return {
+    stream: true,
+    stateType,
+    run: async (onToken) => {
+      const result = await generateCoachReplyStream(
+        { systemPrompt, userMessage: userInput, context },
+        onToken,
+        () => {}  // onError: 已经在 fullContent='' + result.error 体现了
+      );
+      const llmText = (result.fullContent || '').trim();
+
+      if (!llmText) {
+        return fallback;  // LLM 失败,降级到规则回复
+      }
+
+      state.askedPrompts.push(llmText);
+      if (state.askedPrompts.length > 24) state.askedPrompts.shift();
+
+      if (isCacheable && questionHash) {
+        db.saveCachedResponse(questionHash, llmText).catch(e => {
+          console.error('Cache save failed:', e.message);
+        });
+      }
+
+      return { role: 'assistant', type: stateType, content: llmText };
+    }
+  };
+}
+
 function analyzeTrace(state, messages) {
   const events = state.events || [];
   const counts = events.reduce((acc, e) => {
@@ -688,7 +827,7 @@ app.post('/api/chat', async (req, res) => {
   if (conversationMode === 'REVIEW') state.reviewRequested = true;
   if (conversationMode === 'OFF_TOPIC') state.offTopicCount += 1;
 
-  const stateType = classifyState(state, userInput || '');
+  const stateType = classifyState(state, userInput || '', session.messages);
   if (stateType !== 'NORMAL') {
     pushEvent(state, stateType, userInput || '');
   }
@@ -768,6 +907,156 @@ app.post('/api/chat', async (req, res) => {
       metaInterventionCount: state.metaInterventionCount
     }
   });
+});
+
+// ============================================================
+// ★ 流式聊天端点 (SSE) — 学生 app, 提升首字延迟体验
+// ============================================================
+app.post('/api/chat/stream', async (req, res) => {
+  const { sessionId, questionText, userInput, deltaSec = 20, markError = false } = req.body || {};
+  const session = SESSIONS.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  // ---- Rate limit ----
+  if (session.userId && session.userId !== 'guest') {
+    try {
+      const count = await db.incrementUsageCounter(session.userId);
+      if (count > DAILY_LIMIT) {
+        return res.status(429).json({
+          error: 'DAILY_LIMIT',
+          message: '今天的使用次数已达上限，明天再来吧。'
+        });
+      }
+    } catch (e) {
+      console.error('Rate limit check failed:', e.message);
+    }
+  }
+
+  // ---- 跟 /api/chat 一样的 state mutation ----
+  const state = session.state;
+  state.currentQuestion = questionText || state.currentQuestion;
+  state.questionDifficulty = analyzeDifficulty(state.currentQuestion);
+  state.timeSpentSec += Number(deltaSec) || 0;
+
+  if (markError) {
+    state.errorCount += 1;
+    pushEvent(state, 'ERROR', 'user_marked_error');
+  }
+
+  const progressed = markProgress(state, userInput || '');
+  if (progressed) state.noProgressTurns = 0;
+  else state.noProgressTurns += 1;
+  session.messages.push({ role: 'user', content: userInput || '', timestamp: Date.now() });
+
+  const conversationMode = detectConversationMode(userInput || '', state);
+  state.conversationMode = conversationMode;
+  if (conversationMode === 'FINISHED') state.solvedClaimed = true;
+  if (conversationMode === 'REVIEW') state.reviewRequested = true;
+  if (conversationMode === 'OFF_TOPIC') state.offTopicCount += 1;
+
+  const stateType = classifyState(state, userInput || '', session.messages);
+  if (stateType !== 'NORMAL') pushEvent(state, stateType, userInput || '');
+
+  if (stateType === 'TIME') state.shouldOfferSkip = true;
+  if (stateType === 'EMOTION') {
+    state.emotionRisk = 'high';
+    state.emotionCycles += 1;
+  } else state.emotionCycles = 0;
+  if (stateType === 'WITHDRAWAL') {
+    state.withdrawalCount += 1;
+    state.emotionRisk = 'high';
+  } else state.withdrawalCount = 0;
+  if (stateType === 'META_INTERVENTION') state.metaInterventionCount += 1;
+  else state.metaInterventionCount = 0;
+  if (stateType === 'LOW_ENGAGEMENT') state.answerRequestCount += 1;
+  else state.answerRequestCount = 0;
+
+  if (stateType === 'STUCK' || stateType === 'LOW_ENGAGEMENT') state.hintLevel += 1;
+  else if (stateType === 'WITHDRAWAL' || stateType === 'META_INTERVENTION') state.hintLevel = Math.max(1, state.hintLevel);
+  else if (stateType === 'FINISHED' || stateType === 'REVIEW') state.hintLevel = Math.max(0, state.hintLevel - 1);
+  else if (progressed && state.hintLevel > 0) state.hintLevel = Math.max(0, state.hintLevel - 1);
+
+  state.lastStateType = stateType;
+  state.lastStrategy = selectStrategy(stateType, state);
+  state.lastUserIntent = conversationMode;
+
+  // ---- SSE setup ----
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write(': stream-start\n\n');
+
+  function sendEvent(event, data) {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  const stateSummary = {
+    mode: state.mode,
+    timeSpentSec: state.timeSpentSec,
+    hintLevel: state.hintLevel,
+    emotionRisk: state.emotionRisk,
+    questionDifficulty: state.questionDifficulty,
+    shouldOfferSkip: state.shouldOfferSkip,
+    lastStateType: stateType,
+    llmEnabled: getLlmHealth().healthy,
+    lastStrategy: state.lastStrategy,
+    conversationMode: state.conversationMode,
+    offTopicCount: state.offTopicCount,
+    solvedClaimed: state.solvedClaimed,
+    reviewRequested: state.reviewRequested,
+    noProgressTurns: state.noProgressTurns,
+    withdrawalCount: state.withdrawalCount,
+    metaInterventionCount: state.metaInterventionCount
+  };
+
+  try {
+    // 决定是 stream 还是 instant reply
+    const result = await llmQueue.add(() => buildReplyStreamable(stateType, state, session, userInput || ''));
+
+    let finalReply;
+    if (!result.stream) {
+      // 立即回复 (硬编码 / 缓存命中)
+      finalReply = result.reply;
+      // 一次性把内容推过去 (前端也可以处理)
+      sendEvent('full_reply', { reply: finalReply });
+    } else {
+      // 流式 LLM
+      finalReply = await result.run((delta) => {
+        sendEvent('token', { delta });
+      });
+    }
+
+    // 保存到 session.messages
+    session.messages.push({ ...finalReply, timestamp: Date.now() });
+
+    // Persist to DB
+    if (session.userId && session.userId !== 'guest') {
+      try {
+        await db.saveConversation({
+          id: session.convId,
+          userId: session.userId,
+          sessionId: session.id,
+          questionText: state.currentQuestion,
+          messages: session.messages,
+          state
+        });
+      } catch (e) { console.error('DB save error:', e.message); }
+    }
+
+    sendEvent('done', { ok: true, reply: finalReply, state: stateSummary });
+    res.end();
+  } catch (err) {
+    console.error('[chat/stream] error:', err?.message || err);
+    sendEvent('error', { error: '抱歉,出错了,请稍后再试' });
+    sendEvent('done', { ok: false, state: stateSummary });
+    res.end();
+  }
 });
 
 // Submit exam: marks exam mode as finished and unlocks 复盘
@@ -1178,6 +1467,326 @@ app.delete('/api/admin/students/:id', requireTeacher, async (req, res) => {
   res.json(result);
 });
 
+// ============================================================
+// ★ PARENT APP ROUTES (NEW)
+// ============================================================
+
+// 中间件: 必须是已登录的家长
+async function requireParent(req, res, next) {
+  const userId = req.headers['x-user-id'] || '';
+  if (!userId) return res.status(401).json({ error: '未登录' });
+  const user = await db.getUserById(userId);
+  if (!user || user.role !== 'parent') {
+    return res.status(403).json({ error: '需要家长账号' });
+  }
+  req.parentUser = user;
+  next();
+}
+
+// 注册家长账号（独立于学生注册）
+app.post('/api/auth/register/parent', async (req, res) => {
+  const { username, password, displayName } = req.body || {};
+  if (!username || !password) return res.json({ error: '请填写用户名和密码' });
+  if (username.length < 2) return res.json({ error: '用户名至少 2 个字符' });
+  if (password.length < 4) return res.json({ error: '密码至少 4 个字符' });
+  const result = await db.createUser({ username, password, displayName, role: 'parent' });
+  res.json(result);
+});
+
+// 拿到 10 张 gallery cards
+app.get('/api/parents/scenarios', (req, res) => {
+  res.json({ scenarios: scenarios.getAllScenarios() });
+});
+
+// 创建一个新的家长会话（可选地用 scenario card 启动）
+app.post('/api/parents/session', requireParent, async (req, res) => {
+  const { scenarioId } = req.body || {};
+  let openingMessages = [];
+
+  if (scenarioId) {
+    const scenario = scenarios.getScenarioById(scenarioId);
+    if (!scenario) return res.json({ error: '场景不存在' });
+    // 用 scenario 的 openingUserMessage 作为家长第一条消息
+    openingMessages.push({ role: 'user', content: scenario.openingUserMessage });
+  }
+
+  const result = await db.createParentConversation({
+    userId: req.parentUser._id.toString(),
+    scenarioId: scenarioId || null,
+    openingMessages
+  });
+
+  // 注意: 不在这里调用 LLM 了。前端在跳转到 chat 页后,会用
+  // /api/parents/chat/stream (with isOpening: true) 拿到流式首条回复。
+  // 这样首字延迟可以快很多。
+  res.json({
+    conversationId: result.id,
+    scenarioId: scenarioId || null,
+    hasOpeningMessage: openingMessages.length > 0
+  });
+});
+
+// 在已有家长会话里发消息
+app.post('/api/parents/chat', requireParent, async (req, res) => {
+  const { conversationId, message } = req.body || {};
+  if (!conversationId || !message) return res.json({ error: '缺少参数' });
+
+  const convo = await db.getParentConversation(conversationId);
+  if (!convo) return res.json({ error: '会话不存在' });
+  if (convo.userId !== req.parentUser._id.toString()) {
+    return res.status(403).json({ error: '不是你的会话' });
+  }
+
+  // Daily limit check
+  const usage = await db.incrementUsageCounter(req.parentUser._id.toString());
+  if (usage > DAILY_LIMIT) {
+    return res.json({ error: `今天发送次数已达上限 (${DAILY_LIMIT} 条),请明天再聊。` });
+  }
+
+  // Append user message
+  const userMsg = { role: 'user', content: message };
+  await db.appendParentMessage(conversationId, userMsg);
+
+  // Build full message history for LLM
+  const allMessages = [...convo.messages, userMsg];
+
+  // Call LLM
+  const llmResult = await llmQueue.add(() =>
+    parentLlm.generateParentCoachReply(allMessages)
+  );
+
+  if (!llmResult || llmResult.error) {
+    return res.json({
+      error: llmResult?.error || 'LLM 调用失败'
+    });
+  }
+
+  // Append assistant message
+  const assistantMsg = { role: 'assistant', content: llmResult.content };
+  await db.appendParentMessage(conversationId, assistantMsg);
+
+  // Detect expert follow-up trigger
+  const trigger = parentLlm.detectExpertFollowupTrigger(llmResult.content);
+  if (trigger.triggered) {
+    await db.createExpertRequest({
+      userId: req.parentUser._id.toString(),
+      parentConversationId: conversationId,
+      urgency: trigger.urgency
+    });
+  }
+
+  res.json({
+    reply: llmResult.content,
+    expertTrigger: trigger
+  });
+});
+
+// ============================================================
+// ★ 流式聊天端点 (SSE) - 提升首字延迟体验
+// ============================================================
+// 工作方式:
+//   - 浏览器用 fetch + ReadableStream 读取 SSE
+//   - 每个 token 立刻推送给前端,前端逐字渲染
+//   - 流结束后再处理:存数据库 + 触发检测 + 推一条 'done' 事件
+//
+// 兼容: 如果 stream 失败,前端可以回退到 /api/parents/chat (同步版)
+app.post('/api/parents/chat/stream', requireParent, async (req, res) => {
+  const { conversationId, message, isOpening } = req.body || {};
+  // isOpening = true 表示这是 session 创建后第一次调用 (用户消息已经在 DB 里)
+  // isOpening = false / undefined 表示常规跟随消息
+
+  if (!conversationId) {
+    return res.status(400).json({ error: '缺少 conversationId' });
+  }
+
+  const convo = await db.getParentConversation(conversationId);
+  if (!convo) return res.status(404).json({ error: '会话不存在' });
+  if (convo.userId !== req.parentUser._id.toString()) {
+    return res.status(403).json({ error: '不是你的会话' });
+  }
+
+  // 限流
+  const userId = req.parentUser._id.toString();
+  if (!isOpening) {
+    const usage = await db.incrementUsageCounter(userId);
+    if (usage > DAILY_LIMIT) {
+      return res.status(429).json({ error: `今天发送次数已达上限 (${DAILY_LIMIT} 条),请明天再聊。` });
+    }
+  }
+
+  // 追加用户消息 (除非是 opening,opening 时用户消息已经在 DB 里了)
+  let allMessages = [...convo.messages];
+  if (!isOpening) {
+    if (!message) return res.status(400).json({ error: '缺少 message' });
+    const userMsg = { role: 'user', content: message };
+    await db.appendParentMessage(conversationId, userMsg);
+    allMessages.push(userMsg);
+  }
+
+  // 设置 SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'  // 禁用 nginx 缓冲
+  });
+  res.write(': stream-start\n\n');  // SSE comment, 立刻 flush 头部
+
+  // SSE 帮助函数
+  function sendEvent(event, data) {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  // 调用流式 LLM
+  let fullReply = '';
+  try {
+    const result = await llmQueue.add(() =>
+      parentLlm.generateParentCoachReplyStream(
+        allMessages,
+        // onToken: 每收到一段文字就推给前端
+        (delta) => {
+          sendEvent('token', { delta });
+          fullReply += delta;  // 累加用于后续保存
+        },
+        // onError: 把错误推给前端
+        (errMsg) => {
+          sendEvent('error', { error: errMsg });
+        }
+      )
+    );
+
+    // result.fullContent 也是完整回复 (= fullReply,但用 result.fullContent 更可靠)
+    const finalContent = result.fullContent || fullReply;
+
+    if (!finalContent) {
+      // 没拿到任何内容 (LLM 失败了),发结束事件
+      sendEvent('done', {
+        ok: false,
+        error: result.error || '教练没有回应,请稍后重试'
+      });
+      res.end();
+      return;
+    }
+
+    // 保存到数据库
+    const assistantMsg = { role: 'assistant', content: finalContent };
+    await db.appendParentMessage(conversationId, assistantMsg);
+
+    // 检测专家转介
+    const trigger = parentLlm.detectExpertFollowupTrigger(finalContent);
+    if (trigger.triggered) {
+      await db.createExpertRequest({
+        userId: userId,
+        parentConversationId: conversationId,
+        urgency: trigger.urgency
+      });
+    }
+
+    // 发结束事件,带 trigger 信息
+    sendEvent('done', {
+      ok: true,
+      expertTrigger: trigger
+    });
+    res.end();
+  } catch (err) {
+    console.error('[chat/stream] unexpected error:', err?.message || err);
+    sendEvent('error', { error: '抱歉,出错了,请稍后再试' });
+    sendEvent('done', { ok: false });
+    res.end();
+  }
+});
+
+// 提交专家联系电话 (家长在 banner 弹出时填写)
+app.post('/api/parents/expert-request/phone', requireParent, async (req, res) => {
+  const { conversationId, phone } = req.body || {};
+  if (!conversationId) return res.json({ error: '缺少 conversationId' });
+  if (!phone || !/^\d{7,}$/.test(phone.replace(/[\s-]/g, ''))) {
+    return res.json({ error: '请输入有效的电话号码' });
+  }
+
+  const convo = await db.getParentConversation(conversationId);
+  if (!convo) return res.json({ error: '会话不存在' });
+  if (convo.userId !== req.parentUser._id.toString()) {
+    return res.status(403).json({ error: '不是你的会话' });
+  }
+
+  // 找 pending 的 request 并补上 phone + summary
+  const pending = await db.getExpertRequests({ status: 'pending' });
+  const target = pending.find(r =>
+    r.parentConversationId === conversationId &&
+    r.userId === req.parentUser._id.toString()
+  );
+
+  if (target) {
+    // 生成对话摘要
+    const summary = await parentLlm.generateConversationSummary(convo.messages);
+    await db.createExpertRequest({
+      userId: req.parentUser._id.toString(),
+      parentConversationId: conversationId,
+      urgency: target.urgency,
+      parentPhone: phone,
+      conversationSummary: summary
+    });
+  } else {
+    // 没有 pending request,但家长主动留电话——视为 non_crisis
+    const summary = await parentLlm.generateConversationSummary(convo.messages);
+    await db.createExpertRequest({
+      userId: req.parentUser._id.toString(),
+      parentConversationId: conversationId,
+      urgency: 'non_crisis',
+      parentPhone: phone,
+      conversationSummary: summary
+    });
+  }
+
+  res.json({ ok: true });
+});
+
+// 列出此家长所有的对话
+app.get('/api/parents/conversations', requireParent, async (req, res) => {
+  const convos = await db.getParentConversationsByUser(req.parentUser._id.toString());
+  res.json({ conversations: convos });
+});
+
+// 拿一个具体对话（用于继续之前的会话）
+app.get('/api/parents/conversations/:id', requireParent, async (req, res) => {
+  const convo = await db.getParentConversation(req.params.id);
+  if (!convo) return res.status(404).json({ error: '会话不存在' });
+  if (convo.userId !== req.parentUser._id.toString()) {
+    return res.status(403).json({ error: '不是你的会话' });
+  }
+  res.json(convo);
+});
+
+// ============================================================
+// ★ ADMIN ROUTES FOR EXPERT REQUESTS (NEW)
+// ============================================================
+
+// 列出所有专家转介请求
+app.get('/api/admin/expert-requests', requireTeacher, async (req, res) => {
+  const { status, urgency } = req.query;
+  const requests = await db.getExpertRequests({ status, urgency });
+  res.json({ requests });
+});
+
+// 拿一个具体请求（含完整对话）
+app.get('/api/admin/expert-requests/:id', requireTeacher, async (req, res) => {
+  const all = await db.getExpertRequests({});
+  const req_record = all.find(r => r.id === req.params.id);
+  if (!req_record) return res.status(404).json({ error: '请求不存在' });
+  // Pull full conversation
+  const convo = await db.getParentConversation(req_record.parentConversationId);
+  res.json({ request: req_record, conversation: convo });
+});
+
+// 标记 contacted / 加备注
+app.post('/api/admin/expert-requests/:id/update', requireTeacher, async (req, res) => {
+  const { status, notes, parentPhone } = req.body || {};
+  const result = await db.updateExpertRequest(req.params.id, { status, notes, parentPhone });
+  res.json(result);
+});
+
 app.listen(PORT, async () => {
   await db.connect();
   try {
@@ -1195,4 +1804,8 @@ app.listen(PORT, async () => {
   } else {
     console.log(`LLM mode: fallback (${health.error})`);
   }
+  // Load parent system prompt at boot
+  parentLlm.loadSystemPrompt();
+  const ps = parentLlm.getStatus();
+  console.log(`Parent app: model=${ps.model}, prompt=${ps.promptLoaded ? `${Math.round(ps.promptSize/1024)}KB loaded` : 'NOT LOADED'}`);
 });

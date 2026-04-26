@@ -123,6 +123,13 @@ async function createSession() {
   surgeryFinalized = false;
   els.chatLog.innerHTML = '';
   els.summaryPanel.hidden = true;
+
+  // Show quick-action buttons now that a session is active
+  const quickActionsCard = document.getElementById('quickActionsCard');
+  if (quickActionsCard) quickActionsCard.style.display = '';
+  // Hide the example hint (no longer needed)
+  const exampleHint = document.getElementById('exampleHint');
+  if (exampleHint) exampleHint.style.display = 'none';
   setLlmBadge(data.llmHealth);
   applyModeUi(mode);
 
@@ -138,14 +145,7 @@ async function createSession() {
     });
   }
 
-  let openingMsg;
-  if (mode === 'exam') {
-    openingMsg = '考试模式已开始。教练不会给提示。请独立作答，完成后点击"提交答案"。';
-  } else if (mode === 'micro_surgery') {
-    openingMsg = '错题手术已开始。请在左边依次填写三步：定位病灶 → 寻找线索 → 写下炒菜程序。每一步都可以让教练帮你打磨。';
-  } else {
-    openingMsg = '会话已开始。你可以直接输入学生话语来模拟真实做题过程。';
-  }
+  let openingMsg = getModeOpeningMessage(mode);
   addMessage('assistant', openingMsg, 'SYSTEM');
 
   renderState({
@@ -193,6 +193,48 @@ async function submitExam() {
   updateExamUi();
 }
 
+// 流式版本: 创建一个空的 assistant 气泡, 一边接 token 一边往里写
+function addStreamingMessage(metaLabel) {
+  const div = document.createElement('div');
+  div.className = 'message assistant';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble streaming';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = metaLabel || '王鹰教授';
+  const body = document.createElement('div');
+  body.style.whiteSpace = 'pre-wrap';
+  // 初始显示动画点
+  body.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
+  bubble.appendChild(meta);
+  bubble.appendChild(body);
+  div.appendChild(bubble);
+  els.chatLog.appendChild(div);
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+  return { bubble, body, meta };
+}
+
+function appendStreamingText(refs, text, isFinal = false) {
+  // refs: { bubble, body, meta }
+  refs.body.textContent = text;
+  if (!isFinal) {
+    const cursor = document.createElement('span');
+    cursor.className = 'streaming-cursor';
+    cursor.textContent = '▍';
+    refs.body.appendChild(cursor);
+  }
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+}
+
+function finalizeStreamingMessage(refs, finalContent, type) {
+  refs.body.textContent = finalContent;
+  refs.bubble.classList.remove('streaming');
+  if (type) {
+    refs.meta.textContent = `王鹰教授 · ${type}`;
+  }
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+}
+
 async function sendMessage(prefilled = null) {
   if (!sessionId) {
     await createSession();
@@ -204,22 +246,82 @@ async function sendMessage(prefilled = null) {
   addMessage('user', userInput);
   els.userInput.value = '';
 
-  const res = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId,
-      questionText,
-      userInput,
-      deltaSec: Number(els.deltaInput.value || 20),
-      markError: els.markErrorInput.checked,
-      userId: getUserId()
-    })
-  });
-  const data = await res.json();
-  addMessage('assistant', data.reply.content, data.reply.type);
-  renderState(data.state);
-  els.markErrorInput.checked = false;
+  // 创建空气泡 + 显示等待动画
+  const refs = addStreamingMessage('王鹰教授');
+  let accumulated = '';
+  let finalState = null;
+  let finalReplyType = '';
+
+  try {
+    const resp = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        questionText,
+        userInput,
+        deltaSec: Number(els.deltaInput.value || 20),
+        markError: els.markErrorInput.checked,
+        userId: getUserId()
+      })
+    });
+
+    if (!resp.ok) {
+      // 非 200, 比如 429 daily limit. body 是 JSON
+      const errBody = await resp.json().catch(() => ({}));
+      finalizeStreamingMessage(refs, '(' + (errBody.message || errBody.error || '请求失败') + ')', 'ERROR');
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+      const events = sseBuffer.split('\n\n');
+      sseBuffer = events.pop();
+
+      for (const ev of events) {
+        if (!ev.trim()) continue;
+        let eventName = 'message';
+        let dataStr = '';
+        for (const line of ev.split('\n')) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!dataStr) continue;
+        let data;
+        try { data = JSON.parse(dataStr); } catch { continue; }
+
+        if (eventName === 'token') {
+          accumulated += data.delta || '';
+          appendStreamingText(refs, accumulated);
+        } else if (eventName === 'full_reply') {
+          // 非流式 reply (硬编码 / 缓存命中) — 一次性塞进去
+          accumulated = data.reply?.content || '';
+          finalReplyType = data.reply?.type || '';
+          appendStreamingText(refs, accumulated);
+        } else if (eventName === 'error') {
+          accumulated = (accumulated || '') + '\n\n(' + (data.error || '出错') + ')';
+          appendStreamingText(refs, accumulated);
+        } else if (eventName === 'done') {
+          finalState = data.state;
+          if (data.reply && data.reply.type) finalReplyType = data.reply.type;
+          if (data.reply && data.reply.content && !accumulated) accumulated = data.reply.content;
+        }
+      }
+    }
+    finalizeStreamingMessage(refs, accumulated || '(没有回复)', finalReplyType);
+    if (finalState) renderState(finalState);
+  } catch (e) {
+    console.error('stream error:', e);
+    finalizeStreamingMessage(refs, '(网络错误,请稍后再试)', 'ERROR');
+  } finally {
+    els.markErrorInput.checked = false;
+  }
 }
 
 async function loadSummary() {
@@ -566,14 +668,88 @@ async function finalizeSurgery() {
 // ---- Wire up ----
 if (els.newSessionBtn) els.newSessionBtn.addEventListener('click', createSession);
 els.sendBtn.addEventListener('click', () => sendMessage());
+
+// Example hint: clear-example link
+const clearExampleLink = document.getElementById('clearExampleLink');
+if (clearExampleLink) {
+  clearExampleLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    const qInput = document.getElementById('questionInput');
+    if (qInput) {
+      qInput.value = '';
+      qInput.focus();
+    }
+    const exampleHint = document.getElementById('exampleHint');
+    if (exampleHint) exampleHint.style.display = 'none';
+  });
+}
 if (els.loadSummaryBtn) els.loadSummaryBtn.addEventListener('click', loadSummary);
 const submitExamBtn = document.getElementById('submitExamBtn');
 if (submitExamBtn) submitExamBtn.addEventListener('click', submitExam);
 
-// Mode switch should toggle panels live
+// Mode switch with confirmation when there's existing conversation
+// 记住当前模式,这样切换被取消时可以回滚
+let currentMode = els.modeSelect ? els.modeSelect.value : 'practice';
+
+// 取得某个模式对应的开场白文本
+function getModeOpeningMessage(mode) {
+  if (mode === 'exam') {
+    return '考试模式已开始。我不会给任何提示，请独立作答。完成后点"提交答案"，我才会帮你复盘。';
+  }
+  if (mode === 'micro_surgery') {
+    return '错题手术开始。\n\n这不是让你抄错题——抄一万遍，下次还是会错。我们要做的是把你这次错的原因，变成一个**自动触发的程序**，下次遇到同类题，大脑直接调用，不用再想。\n\n按三步来，依次在左边填：\n\n**第一步：定位病灶** —— 你这道题到底卡在哪一步？不是"粗心"，不是"没看清"，要具体到"我不知道这里要做什么"。\n\n**第二步：寻找线索** —— 题目里有什么字、什么条件，本来应该提醒你用上面那个方法的？这是触发器。\n\n**第三步：写下炒菜程序** —— 写成"以后看到 X，直接做 Y"的格式。越机械越好，目标是让大脑不用思考就能反应。\n\n---\n\n举个例子，几何题里有道题你做错了：\n\n• **病灶定位**：我不知道这里要加辅助线构造全等。\n• **触发线索**：题目里的"中点"两个字。\n• **写入程序**：以后看到"中点 + 线段倍数" → 直接倍长中线。\n\n看到没？现在你不用再"想"了——下次只要题目里出现"中点"，你的手会自动开始倍长中线。这才叫真正掌握。\n\n---\n\n准备好了，先把你这道错题在左边题目框写下来，然后开始第一步。每填完一步，可以让我帮你打磨。';
+  }
+  // practice (default)
+  return '好，我们开始这道题。先告诉我：你看了这道题第一感觉是什么？是哪一步让你觉得"这个我不太确定"？';
+}
+
+// 判断聊天框里是否有真正的对话(用户说过话)
+function hasUserMessages() {
+  if (!els.chatLog) return false;
+  return els.chatLog.querySelectorAll('.chat-msg.user').length > 0;
+}
+
 if (els.modeSelect) {
   els.modeSelect.addEventListener('change', () => {
-    applyModeUi(els.modeSelect.value);
+    const newMode = els.modeSelect.value;
+    if (newMode === currentMode) return;  // 没真切
+
+    // 如果对话还没真正开始 (没有用户发过消息),直接切,不打扰
+    if (!hasUserMessages()) {
+      currentMode = newMode;
+      applyModeUi(newMode);
+      // 清掉之前的欢迎语 / 旧开场白,显示新模式的介绍
+      els.chatLog.innerHTML = '';
+      addMessage('assistant', getModeOpeningMessage(newMode), 'SYSTEM');
+      return;
+    }
+
+    // 已经在聊天了 — 弹确认
+    const modeNames = { practice: '练习', exam: '考试', micro_surgery: '错题手术' };
+    const ok = window.confirm(
+      `切换到"${modeNames[newMode] || newMode}"模式会清空当前对话。\n\n确定要切换吗？`
+    );
+    if (!ok) {
+      // 学生取消了 — 把下拉框跳回原来的值
+      els.modeSelect.value = currentMode;
+      return;
+    }
+
+    // 学生确认了 — 真正切换
+    currentMode = newMode;
+    applyModeUi(newMode);
+    els.chatLog.innerHTML = '';
+    addMessage('assistant', getModeOpeningMessage(newMode), 'SYSTEM');
+
+    // 重置 session 状态 (跟原来 createSession 的清理一致)
+    sessionId = null;
+    sessionMode = newMode;
+    examSubmitted = false;
+    surgeryFinalized = false;
+    if (els.summaryPanel) els.summaryPanel.hidden = true;
+    // 隐藏 quick-actions 按钮 (新会话还没正式开始)
+    const quickActionsCard = document.getElementById('quickActionsCard');
+    if (quickActionsCard) quickActionsCard.style.display = 'none';
   });
 }
 
@@ -594,5 +770,12 @@ document.querySelectorAll('.quick-actions button').forEach((btn) => {
 
 // Apply initial mode (in case user refreshes with exam or surgery preselected)
 applyModeUi(els.modeSelect ? els.modeSelect.value : 'practice');
+
+// 入口欢迎语 — 学生一打开页面就看到, 不用点任何按钮
+addMessage(
+  'assistant',
+  '欢迎使用茹意宝！\n\n这个软件使用起来很简单：\n1. 在左边的"题目"框里粘贴一道你的题（已经预填了一道示例题，可以直接试）。\n2. 点"开始陪练这道题"按钮，开始和我对话。\n3. 我会通过提问帮你找到答案——不会直接给答案。\n\n准备好了告诉我。卡住了也可以直接说"我卡住了"，我会帮你。',
+  'WELCOME'
+);
 
 checkLlmHealth();

@@ -36,9 +36,13 @@
         <section class="panel question-panel">
           <div id="practicePanel">
             <h2>题目</h2>
-            <textarea id="questionInput" rows="7" placeholder="输入一道中考数学题，例如：已知 y = x^2 - 4x + 3，求最小值。"></textarea>
+            <textarea id="questionInput" rows="7" placeholder="输入一道中考数学题，例如：已知 y = x^2 - 4x + 3，求最小值。">已知二次函数 y = x² - 4x + 3。(1) 求函数的对称轴和顶点坐标。(2) 当 x 在什么范围内时，y < 0？(3) 若把图象向右平移 2 个单位，再向下平移 1 个单位，求新函数的解析式。</textarea>
+            <div style="font-size:12px;color:var(--muted);margin-top:-4px;margin-bottom:10px;" id="exampleHint">
+              👆 这是一道示例题，可以直接试 ·
+              <a href="#" id="clearExampleLink" style="color:var(--primary);">清空换成自己的</a>
+            </div>
             <div class="row">
-              <button id="newSessionBtn">开始新会话</button>
+              <button id="newSessionBtn">开始陪练这道题</button>
               <button id="loadSummaryBtn" class="secondary">查看复盘</button>
               <button id="submitExamBtn" style="display:none;background:#ef4444;color:#fff;">提交答案</button>
             </div>
@@ -55,8 +59,8 @@
                 <div>建议跳题：否</div>
               </div>
             </div>
-            <div class="tips-card">
-              <h3>快捷输入</h3>
+            <div class="tips-card" id="quickActionsCard" style="display:none;">
+              <h3>快捷输入 <span style="font-size:11px;color:var(--muted);font-weight:normal;">· 做题中卡住时点这里</span></h3>
               <div class="quick-actions">
                 <button data-text="我不会开始">我不会开始</button>
                 <button data-text="我怎么这么笨，我完了">情绪崩溃</button>
@@ -170,6 +174,10 @@
       try { mcUser = JSON.parse(localStorage.getItem('mc_user')); } catch {}
       if (!mcUser || !mcUser.id) {
         window.location.href = '/login.html';
+      }
+      // 如果是家长账号,自动跳到 /parents
+      if (mcUser && mcUser.role === 'parent') {
+        window.location.href = '/parents/';
       }
       document.getElementById('userDisplay').textContent = mcUser ? mcUser.displayName : '';
       if (mcUser && mcUser.role === 'teacher') {

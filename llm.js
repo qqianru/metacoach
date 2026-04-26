@@ -133,6 +133,74 @@ async function generateCoachReply({ systemPrompt, userMessage, context }) {
   }
 }
 
+/**
+ * 流式版本的 generateCoachReply.
+ * onToken(delta) 会在每收到一段文字时被调用.
+ * 返回: { fullContent: 完整文本, error?: string }
+ */
+async function generateCoachReplyStream({ systemPrompt, userMessage, context }, onToken, onError) {
+  const openai = getClient();
+  if (!openai) {
+    if (onError) onError('LLM 未配置');
+    return { fullContent: '', error: 'LLM 未配置' };
+  }
+
+  // 重试逻辑 (跟 parent_llm 一样)
+  const RETRY_DELAYS_MS = [1000, 3000, 7000];
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const stream = await openai.chat.completions.create({
+        model: getModel(),
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Context:\n${JSON.stringify(context, null, 2)}\n\nStudent message:\n${userMessage}` }
+        ],
+        temperature: 0.6,
+        max_tokens: 800,
+        stream: true,
+        stream_options: { include_usage: true }
+      });
+
+      let fullContent = '';
+      let usage = {};
+
+      for await (const chunk of stream) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          fullContent += delta;
+          if (onToken) onToken(delta);
+        }
+        if (chunk.usage) usage = chunk.usage;
+      }
+
+      const promptTokens = usage.prompt_tokens || 0;
+      const completionTokens = usage.completion_tokens || 0;
+      console.log(`[LLM-stream] ${promptTokens} prompt + ${completionTokens} output${attempt > 0 ? ` (after ${attempt} retries)` : ''}`);
+      return { fullContent: fullContent.trim(), usage };
+    } catch (err) {
+      lastError = err;
+      const status = err?.status || err?.response?.status || 0;
+      const isRetryable = status === 429 || (status >= 500 && status < 600);
+      if (!isRetryable || attempt >= RETRY_DELAYS_MS.length) {
+        console.error(`[LLM-stream] failed (attempt ${attempt + 1}, status ${status}):`, err?.message || err);
+        break;
+      }
+      const wait = RETRY_DELAYS_MS[attempt];
+      console.warn(`[LLM-stream] ${status} on attempt ${attempt + 1}, retrying in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+
+  const status = lastError?.status || lastError?.response?.status || 0;
+  const errMsg = status === 429
+    ? '当前请求人数较多，请等几秒再试一次。'
+    : '抱歉，教练暂时回复不了。请稍后再试。';
+  if (onError) onError(errMsg);
+  return { fullContent: '', error: errMsg };
+}
+
 // ============================================================
 // 复盘：基于金洪源元认知心理干预技术生成结构化复盘
 // 返回：知识点定位 + S-E-R 链条 + CER 程序识别 + 元认知训练任务
@@ -419,6 +487,7 @@ module.exports = {
   checkLlmHealth,
   getLlmHealth,
   generateCoachReply,
+  generateCoachReplyStream,
   generateMetacognitiveSummary,
   generateSurgeryStepFeedback,
   generateSurgeryCard

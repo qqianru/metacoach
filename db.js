@@ -1,5 +1,5 @@
 // db.js - MongoDB Atlas persistence via Mongoose
-// 用 Mongoose 连接 MongoDB Atlas 免费集群，数据不会因 Render 重启而丢失
+// 扩展版：增加 parent role + parent chat + expert request
 
 const mongoose = require('mongoose');
 const crypto = require('crypto');
@@ -11,11 +11,13 @@ const crypto = require('crypto');
 const userSchema = new mongoose.Schema({
   username:    { type: String, required: true, unique: true, trim: true },
   displayName: { type: String, default: '' },
-  role:        { type: String, enum: ['student', 'teacher'], default: 'student' },
+  // ★ 扩展 enum: 增加 'parent'
+  role:        { type: String, enum: ['student', 'parent', 'teacher'], default: 'student' },
   passwordHash:{ type: String, required: true },
   createdAt:   { type: Number, default: () => Date.now() }
 });
 
+// 学生会话（保持原有结构）
 const conversationSchema = new mongoose.Schema({
   userId:       { type: String, required: true, index: true },
   sessionId:    { type: String, index: true},
@@ -27,31 +29,49 @@ const conversationSchema = new mongoose.Schema({
   updatedAt:    { type: Number, default: () => Date.now() }
 });
 
-// ============================================================
-// Rate limit schema (per-user daily counter)
-// ============================================================
+// ★ 新增：家长会话（结构更简单——只是聊天记录）
+const parentConversationSchema = new mongoose.Schema({
+  userId:       { type: String, required: true, index: true },
+  scenarioId:   { type: String, default: null },
+  messages:     { type: Array, default: [] },
+  expertRequested: { type: Boolean, default: false },
+  createdAt:    { type: Number, default: () => Date.now() },
+  updatedAt:    { type: Number, default: () => Date.now() }
+});
+
+// ★ 新增：专家转介请求
+const expertRequestSchema = new mongoose.Schema({
+  userId:                { type: String, required: true, index: true },
+  parentConversationId:  { type: String, required: true, index: true },
+  urgency:               { type: String, enum: ['severe', 'non_crisis'], required: true },
+  status:                { type: String, enum: ['pending', 'contacted', 'resolved'], default: 'pending' },
+  parentPhone:           { type: String, default: '' },
+  conversationSummary:   { type: String, default: '' },
+  notes:                 { type: String, default: '' },
+  createdAt:             { type: Number, default: () => Date.now() },
+  contactedAt:           { type: Number, default: null }
+});
+
 const rateLimitSchema = new mongoose.Schema({
   userId: { type: String, required: true },
-  date:   { type: String, required: true },  // YYYY-MM-DD
+  date:   { type: String, required: true },
   count:  { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now, expires: 172800 }  // auto-delete after 48h
+  createdAt: { type: Date, default: Date.now, expires: 172800 }
 });
 rateLimitSchema.index({ userId: 1, date: 1 }, { unique: true });
 
-// ============================================================
-// Response cache schema (shared AI response cache)
-// ============================================================
 const responseCacheSchema = new mongoose.Schema({
   questionHash: { type: String, required: true, unique: true, index: true },
   content:      { type: String, required: true },
-  createdAt:    { type: Date, default: Date.now, expires: 2592000 }  // auto-delete after 30 days
+  createdAt:    { type: Date, default: Date.now, expires: 2592000 }
 });
 
 const RateLimit = mongoose.model('RateLimit', rateLimitSchema);
 const ResponseCache = mongoose.model('ResponseCache', responseCacheSchema);
-
 const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
+const ParentConversation = mongoose.model('ParentConversation', parentConversationSchema);
+const ExpertRequest = mongoose.model('ExpertRequest', expertRequestSchema);
 
 // ============================================================
 // Connect
@@ -61,7 +81,6 @@ async function connect() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
     console.error('WARNING: No MONGODB_URI set. Database will NOT work.');
-    console.error('Set MONGODB_URI in your .env or Render environment variables.');
     return;
   }
   try {
@@ -73,7 +92,7 @@ async function connect() {
 }
 
 // ============================================================
-// Password hashing (sha256 + salt)
+// Password hashing
 // ============================================================
 
 function hashPassword(plain) {
@@ -121,6 +140,9 @@ async function getUserByUsername(username) {
 }
 
 async function createUser({ username, password, displayName = '', role = 'student' }) {
+  if (!['student', 'parent', 'teacher'].includes(role)) {
+    return { error: '无效的角色类型' };
+  }
   const existing = await User.findOne({ username });
   if (existing) return { error: '用户名已存在' };
   const user = await User.create({
@@ -145,8 +167,8 @@ async function updateUser(id, updates) {
 async function deleteUser(id) {
   const user = await User.findByIdAndDelete(id);
   if (!user) return { error: '用户不存在' };
-  // Also delete user's conversations
   await Conversation.deleteMany({ userId: id });
+  await ParentConversation.deleteMany({ userId: id });
   return { ok: true };
 }
 
@@ -158,7 +180,7 @@ async function authenticateUser(username, password) {
 }
 
 // ============================================================
-// Conversation CRUD
+// Student Conversation CRUD (existing, unchanged)
 // ============================================================
 
 async function getConversationsByUser(userId) {
@@ -180,7 +202,6 @@ async function getConversation(id) {
 
 async function saveConversation({ id, userId, sessionId, questionText, messages, state, summary }) {
   if (id) {
-    // Try to update existing
     const existing = await Conversation.findById(id);
     if (existing) {
       if (questionText !== undefined) existing.questionText = questionText;
@@ -192,10 +213,8 @@ async function saveConversation({ id, userId, sessionId, questionText, messages,
       return { id: existing._id.toString() };
     }
   }
-  // Create new
   const convo = await Conversation.create({
-    userId,
-    sessionId,
+    userId, sessionId,
     questionText: questionText || '',
     messages: messages || [],
     state: state || {},
@@ -211,7 +230,118 @@ async function deleteConversation(id) {
 }
 
 // ============================================================
-// Bootstrap: create default teacher if none exists
+// ★ Parent Conversation CRUD (NEW)
+// ============================================================
+
+async function createParentConversation({ userId, scenarioId = null, openingMessages = [] }) {
+  const convo = await ParentConversation.create({
+    userId,
+    scenarioId,
+    messages: openingMessages
+  });
+  return { id: convo._id.toString() };
+}
+
+async function getParentConversation(id) {
+  try {
+    const c = await ParentConversation.findById(id).lean();
+    if (!c) return null;
+    const { _id, __v, ...rest } = c;
+    return { id: _id.toString(), ...rest };
+  } catch { return null; }
+}
+
+async function getParentConversationsByUser(userId) {
+  const convos = await ParentConversation.find({ userId })
+    .sort({ updatedAt: -1 })
+    .lean();
+  return convos.map(c => {
+    const { _id, __v, ...rest } = c;
+    return { id: _id.toString(), ...rest };
+  });
+}
+
+async function appendParentMessage(conversationId, message) {
+  const convo = await ParentConversation.findById(conversationId);
+  if (!convo) return { error: '会话不存在' };
+  convo.messages.push(message);
+  convo.updatedAt = Date.now();
+  await convo.save();
+  return { ok: true, messageCount: convo.messages.length };
+}
+
+async function markParentConversationExpertRequested(conversationId) {
+  await ParentConversation.findByIdAndUpdate(conversationId, {
+    expertRequested: true,
+    updatedAt: Date.now()
+  });
+}
+
+// ============================================================
+// ★ Expert Request CRUD (NEW)
+// ============================================================
+
+async function createExpertRequest({ userId, parentConversationId, urgency, parentPhone = '', conversationSummary = '' }) {
+  const existing = await ExpertRequest.findOne({
+    parentConversationId,
+    status: 'pending'
+  });
+  if (existing) {
+    if (parentPhone && !existing.parentPhone) existing.parentPhone = parentPhone;
+    if (urgency === 'severe' && existing.urgency !== 'severe') existing.urgency = 'severe';
+    if (conversationSummary) existing.conversationSummary = conversationSummary;
+    await existing.save();
+    return { id: existing._id.toString(), updated: true };
+  }
+  const req = await ExpertRequest.create({
+    userId,
+    parentConversationId,
+    urgency,
+    parentPhone,
+    conversationSummary
+  });
+  await markParentConversationExpertRequested(parentConversationId);
+  return { id: req._id.toString(), created: true };
+}
+
+async function getExpertRequests({ status = null, urgency = null } = {}) {
+  const filter = {};
+  if (status) filter.status = status;
+  if (urgency) filter.urgency = urgency;
+  const requests = await ExpertRequest.find(filter)
+    .sort({ urgency: 1, createdAt: -1 })
+    .lean();
+  const userIds = [...new Set(requests.map(r => r.userId))];
+  const users = await User.find({ _id: { $in: userIds } }).lean();
+  const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+  return requests.map(r => {
+    const { _id, __v, ...rest } = r;
+    const user = userMap[r.userId];
+    return {
+      id: _id.toString(),
+      ...rest,
+      username: user ? user.username : '(unknown)',
+      displayName: user ? user.displayName : ''
+    };
+  });
+}
+
+async function updateExpertRequest(id, updates) {
+  const allowedFields = ['status', 'parentPhone', 'notes', 'contactedAt'];
+  const filtered = {};
+  for (const k of allowedFields) {
+    if (updates[k] !== undefined) filtered[k] = updates[k];
+  }
+  if (filtered.status === 'contacted' && !filtered.contactedAt) {
+    filtered.contactedAt = Date.now();
+  }
+  const req = await ExpertRequest.findByIdAndUpdate(id, filtered, { new: true });
+  if (!req) return { error: '请求不存在' };
+  return { ok: true };
+}
+
+// ============================================================
+// Bootstrap
 // ============================================================
 
 async function ensureDefaultTeacher() {
@@ -228,10 +358,10 @@ async function ensureDefaultTeacher() {
 }
 
 // ============================================================
-// Rate limiting
+// Rate limiting + response cache
 // ============================================================
 async function incrementUsageCounter(userId) {
-  const today = new Date().toISOString().slice(0, 10);  // "2026-04-23"
+  const today = new Date().toISOString().slice(0, 10);
   const doc = await RateLimit.findOneAndUpdate(
     { userId, date: today },
     { $inc: { count: 1 }, $setOnInsert: { createdAt: new Date() } },
@@ -246,9 +376,6 @@ async function getUsageCount(userId) {
   return doc ? doc.count : 0;
 }
 
-// ============================================================
-// Response cache
-// ============================================================
 async function getCachedResponse(questionHash) {
   const doc = await ResponseCache.findOne({ questionHash }).lean();
   return doc ? doc.content : null;
@@ -258,11 +385,9 @@ async function saveCachedResponse(questionHash, content) {
   try {
     await ResponseCache.create({ questionHash, content });
   } catch (err) {
-    // duplicate key is fine — another request cached it first
     if (err.code !== 11000) console.error('Cache save error:', err.message);
   }
 }
-
 
 module.exports = {
   connect,
@@ -279,10 +404,19 @@ module.exports = {
   getConversation,
   saveConversation,
   deleteConversation,
-  // NEW: rate limiting
+  // NEW: parent conversation
+  createParentConversation,
+  getParentConversation,
+  getParentConversationsByUser,
+  appendParentMessage,
+  markParentConversationExpertRequested,
+  // NEW: expert request
+  createExpertRequest,
+  getExpertRequests,
+  updateExpertRequest,
+  // existing
   incrementUsageCounter,
   getUsageCount,
-  // NEW: response caching
   getCachedResponse,
   saveCachedResponse
 };

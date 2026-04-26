@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>茹意宝 · 教练对话</title>
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/parents.css" />
+  </head>
+  <body>
+    <div class="app-shell parent-chat-shell">
+      <header class="topbar">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <a href="/parents/" style="color:var(--muted);text-decoration:none;font-size:14px;">← 回到场景库</a>
+        </div>
+        <div class="user-bar">
+          <span id="userDisplay" style="font-size:13px;color:var(--muted);"></span>
+          <button class="secondary" id="logoutBtn" style="font-size:12px;padding:6px 10px;">退出</button>
+        </div>
+      </header>
+
+      <main class="parent-chat-main">
+        <div id="expertBanner" class="expert-banner" style="display:none;"></div>
+        <div id="chatLog" class="chat-log parent-chat-log"></div>
+        <div class="composer parent-composer">
+          <textarea id="userInput" rows="3" placeholder="告诉教练你的情况，或者教练问你的问题…"></textarea>
+          <div class="row">
+            <button id="sendBtn">发送</button>
+          </div>
+        </div>
+      </main>
+
+      <!-- 专家联系电话弹窗 -->
+      <div id="phoneDialog" class="phone-dialog" style="display:none;">
+        <div class="phone-dialog-card">
+          <h3 id="phoneDialogTitle">📞 留个电话给后台专家</h3>
+          <p id="phoneDialogText">请留一个方便接电话的号码。我们后台员工会安排专家在合适的时间联系你。</p>
+          <input type="tel" id="phoneInput" placeholder="例如：13xxxxxxxxx" />
+          <div class="row">
+            <button id="phoneSubmitBtn" class="primary-btn">提交</button>
+            <button id="phoneSkipBtn" class="secondary">先不留，继续聊</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ---- Auth ----
+      let mcUser = null;
+      try { mcUser = JSON.parse(localStorage.getItem('mc_user')); } catch {}
+      if (!mcUser || !mcUser.id) window.location.href = '/login.html?role=parent';
+      if (mcUser && mcUser.role !== 'parent') {
+        if (mcUser.role === 'student') window.location.href = '/';
+        else if (mcUser.role === 'teacher') window.location.href = '/admin.html';
+      }
+      document.getElementById('userDisplay').textContent = mcUser ? mcUser.displayName : '';
+      document.getElementById('logoutBtn').addEventListener('click', () => {
+        localStorage.removeItem('mc_user');
+        window.location.href = '/login.html';
+      });
+
+      // ---- Get conversation id from URL ----
+      const params = new URLSearchParams(window.location.search);
+      const conversationId = params.get('id');
+      if (!conversationId) {
+        alert('缺少会话 id');
+        window.location.href = '/parents/';
+      }
+
+      const els = {
+        chatLog: document.getElementById('chatLog'),
+        userInput: document.getElementById('userInput'),
+        sendBtn: document.getElementById('sendBtn'),
+        expertBanner: document.getElementById('expertBanner'),
+        phoneDialog: document.getElementById('phoneDialog'),
+        phoneDialogTitle: document.getElementById('phoneDialogTitle'),
+        phoneDialogText: document.getElementById('phoneDialogText'),
+        phoneInput: document.getElementById('phoneInput'),
+        phoneSubmitBtn: document.getElementById('phoneSubmitBtn'),
+        phoneSkipBtn: document.getElementById('phoneSkipBtn')
+      };
+
+      let busy = false;
+      let lastUrgency = null;  // 'severe' | 'non_crisis' | null
+      let phoneSubmitted = false;
+
+      // ---- Render a message ----
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      }
+
+      function addMessage(role, content) {
+        const div = document.createElement('div');
+        div.className = `chat-msg ${role}`;
+        const html = escapeHtml(content)
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+        div.innerHTML = `<div class="chat-bubble">${html}</div>`;
+        els.chatLog.appendChild(div);
+        els.chatLog.scrollTop = els.chatLog.scrollHeight;
+      }
+
+      function setBusy(on) {
+        busy = on;
+        els.sendBtn.disabled = on;
+        els.userInput.disabled = on;
+        els.sendBtn.textContent = on ? '教练在思考...' : '发送';
+      }
+
+      // ---- Banner + phone dialog ----
+      function showExpertBanner(urgency) {
+        lastUrgency = urgency;
+        const isSevere = urgency === 'severe';
+        els.expertBanner.className = 'expert-banner ' + (isSevere ? 'severe' : 'non_crisis');
+        els.expertBanner.innerHTML = isSevere
+          ? `<div><strong>✓ 已记下你的情况</strong><br>这种情况需要专家面谈一次。请留一个电话方便联系。</div>
+             <button class="primary-btn" id="bannerPhoneBtn">留电话 →</button>`
+          : `<div><strong>✓ 已记下你的需求</strong><br>后台员工会安排专家在合适的时间联系你做深入咨询。</div>
+             <button class="primary-btn" id="bannerPhoneBtn">留电话 →</button>`;
+        els.expertBanner.style.display = 'flex';
+
+        const btn = document.getElementById('bannerPhoneBtn');
+        if (btn) btn.addEventListener('click', () => showPhoneDialog(urgency));
+
+        // 严重信号自动弹窗一次
+        if (isSevere && !phoneSubmitted) {
+          setTimeout(() => showPhoneDialog(urgency), 500);
+        }
+      }
+
+      function showPhoneDialog(urgency) {
+        const isSevere = urgency === 'severe';
+        els.phoneDialogTitle.textContent = isSevere ? '📞 留个电话，专家会尽快联系' : '📞 留个电话给后台专家';
+        els.phoneDialogText.textContent = isSevere
+          ? '你描述的情况需要专家面谈一次。留一个方便接电话的号码，我们后台员工会安排专家联系你。'
+          : '请留一个方便接电话的号码。我们后台员工会安排专家在合适的时间联系你做深入咨询。';
+        els.phoneDialog.style.display = 'flex';
+        els.phoneInput.focus();
+      }
+
+      function hidePhoneDialog() {
+        els.phoneDialog.style.display = 'none';
+      }
+
+      els.phoneSkipBtn.addEventListener('click', hidePhoneDialog);
+      els.phoneSubmitBtn.addEventListener('click', async () => {
+        const phone = els.phoneInput.value.trim();
+        if (!phone || phone.replace(/[\s-]/g, '').length < 7) {
+          alert('请输入有效的电话号码');
+          return;
+        }
+        try {
+          const r = await fetch('/api/parents/expert-request/phone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-id': mcUser.id },
+            body: JSON.stringify({ conversationId, phone })
+          });
+          const data = await r.json();
+          if (data.error) {
+            alert(data.error);
+            return;
+          }
+          phoneSubmitted = true;
+          hidePhoneDialog();
+          els.expertBanner.innerHTML = '<div><strong>✓ 电话已记录</strong>，专家会在合适的时间联系你。</div>';
+          els.expertBanner.classList.add('phone_done');
+        } catch (e) {
+          alert('提交失败,请稍后重试');
+        }
+      });
+
+      // ---- Append empty assistant bubble that we can stream into ----
+      function addStreamingMessage() {
+        const div = document.createElement('div');
+        div.className = 'chat-msg assistant';
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-bubble streaming';
+        // 显示等待动画
+        bubble.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
+        div.appendChild(bubble);
+        els.chatLog.appendChild(div);
+        els.chatLog.scrollTop = els.chatLog.scrollHeight;
+        return bubble;  // 返回 bubble,让流式更新
+      }
+
+      // 把已经有的 markdown-y 文本格式化成 HTML 并塞进 bubble
+      function renderIntoBubble(bubble, content) {
+        const html = escapeHtml(content)
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+        bubble.innerHTML = html;
+        // 加一个闪烁的光标提示还在流
+        const cursor = document.createElement('span');
+        cursor.className = 'streaming-cursor';
+        cursor.textContent = '▍';
+        bubble.appendChild(cursor);
+        els.chatLog.scrollTop = els.chatLog.scrollHeight;
+      }
+
+      function finalizeBubble(bubble, finalContent) {
+        const html = escapeHtml(finalContent)
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+        bubble.innerHTML = html;
+        bubble.classList.remove('streaming');
+      }
+
+      // ---- Send message via streaming SSE ----
+      async function sendMessageStream(text, isOpening = false) {
+        if (busy) return;
+        if (!isOpening && (!text || !text.trim())) return;
+
+        // 用户消息: 如果是 opening 已经在 DB 里了, 不要再加
+        if (!isOpening) {
+          addMessage('user', text);
+          els.userInput.value = '';
+        }
+        setBusy(true);
+
+        // 创建空的 assistant 气泡, 后续往里 append
+        const bubble = addStreamingMessage();
+        let accumulated = '';
+
+        try {
+          const resp = await fetch('/api/parents/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-id': mcUser.id },
+            body: JSON.stringify({
+              conversationId,
+              message: isOpening ? null : text,
+              isOpening
+            })
+          });
+
+          if (!resp.ok && !resp.body) {
+            const errText = await resp.text();
+            finalizeBubble(bubble, `(出错: ${errText || resp.status})`);
+            return;
+          }
+
+          // 读 SSE stream
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let sseBuffer = '';
+          let lastEvent = 'message';
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+
+            // SSE 是按 \n\n 分隔每个 event
+            const events = sseBuffer.split('\n\n');
+            sseBuffer = events.pop();  // 最后一段可能不完整,留着下次拼
+
+            for (const ev of events) {
+              if (!ev.trim()) continue;
+              // 解析每行
+              let eventName = 'message';
+              let dataStr = '';
+              for (const line of ev.split('\n')) {
+                if (line.startsWith('event:')) eventName = line.slice(6).trim();
+                else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+                else if (line.startsWith(':')) {
+                  // SSE comment, 忽略
+                }
+              }
+              if (!dataStr) continue;
+
+              let data;
+              try { data = JSON.parse(dataStr); }
+              catch { continue; }
+
+              if (eventName === 'token') {
+                accumulated += data.delta || '';
+                renderIntoBubble(bubble, accumulated);
+              } else if (eventName === 'error') {
+                accumulated += `\n\n(${data.error || '出错'})`;
+                renderIntoBubble(bubble, accumulated);
+              } else if (eventName === 'done') {
+                finalizeBubble(bubble, accumulated || '(没有回复)');
+                if (data.expertTrigger && data.expertTrigger.triggered) {
+                  showExpertBanner(data.expertTrigger.urgency);
+                }
+                if (!data.ok && !accumulated) {
+                  finalizeBubble(bubble, '(' + (data.error || '教练没回应') + ')');
+                }
+              }
+            }
+          }
+          // 流自然结束(对方 close)
+          if (!bubble.classList.contains('streaming')) {
+            // 已经被 finalize 过 — 没事
+          } else {
+            finalizeBubble(bubble, accumulated || '(教练没回应)');
+          }
+        } catch (e) {
+          console.error('stream error:', e);
+          finalizeBubble(bubble, '(网络错误,请稍后再试)');
+        } finally {
+          setBusy(false);
+          els.userInput.focus();
+        }
+      }
+
+      // ---- Legacy send (unused, kept as backup) ----
+      async function sendMessage(text) {
+        return sendMessageStream(text, false);
+      }
+
+      els.sendBtn.addEventListener('click', () => sendMessage(els.userInput.value));
+      els.userInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage(els.userInput.value);
+        }
+      });
+
+      // ---- Load existing conversation on mount ----
+      async function loadConversation() {
+        try {
+          const r = await fetch('/api/parents/conversations/' + conversationId, {
+            headers: { 'x-user-id': mcUser.id }
+          });
+          const convo = await r.json();
+          if (convo.error) {
+            alert(convo.error);
+            window.location.href = '/parents/';
+            return;
+          }
+          for (const m of convo.messages) {
+            addMessage(m.role, m.content);
+          }
+          // 如果之前已经触发过专家转介,显示 banner (但不自动弹窗)
+          if (convo.expertRequested) {
+            els.expertBanner.style.display = 'flex';
+            els.expertBanner.className = 'expert-banner phone_done';
+            els.expertBanner.innerHTML = '<div><strong>✓ 已记下你的需求</strong>，专家会联系你。</div>';
+            phoneSubmitted = true;
+          }
+
+          // 情况 1: 来自 scenario card — 已经有 1 条 user message, 0 条 assistant
+          //         → 触发流式拿教练的 opening reply
+          const userCount = convo.messages.filter(m => m.role === 'user').length;
+          const assistantCount = convo.messages.filter(m => m.role === 'assistant').length;
+
+          if (userCount === 1 && assistantCount === 0) {
+            // Card-driven session: stream the opening reply
+            sendMessageStream(null, true);
+            return;
+          }
+
+          // 情况 2: 来自自定义输入框 — DB 里啥都没有, 待发送的消息在 sessionStorage
+          const pendingFirst = sessionStorage.getItem('parents_pending_first_msg');
+          if (pendingFirst && convo.messages.length === 0) {
+            sessionStorage.removeItem('parents_pending_first_msg');
+            sendMessageStream(pendingFirst, false);
+          }
+          // 否则就是回到一个老的对话, 啥都不用做
+        } catch (e) {
+          console.error(e);
+          alert('载入会话失败');
+        }
+      }
+
+      loadConversation();
+    </script>
+  </body>
+</html>
