@@ -106,6 +106,38 @@ function applyModeUi(mode) {
   const isSurgery = mode === 'micro_surgery';
   if (els.practicePanel) els.practicePanel.style.display = isSurgery ? 'none' : '';
   if (els.surgeryPanel) els.surgeryPanel.style.display = isSurgery ? '' : 'none';
+
+  // Update the practice/exam intro card to match the current mode.
+  // (Surgery has its own intro paragraph, no swap needed.)
+  const introEl = document.getElementById('practiceIntro');
+  if (introEl) {
+    if (mode === 'exam') {
+      introEl.innerHTML =
+        '<div class="mode-intro-title">📝 考试模式 · 教练全程不说话</div>' +
+        '<div class="mode-intro-body">' +
+          '想测一下自己真实水平？这个模式我会闭嘴，只看着你做。' +
+          '<ol>' +
+            '<li>在下面的"题目"框里贴一道题。</li>' +
+            '<li>点"开始陪练这道题"，开始独立作答。中间不会有任何提示。</li>' +
+            '<li>做完后点"提交答案"，我才会出现，帮你复盘哪几步走得稳、哪几步差点翻车。</li>' +
+          '</ol>' +
+        '</div>';
+    } else {
+      // practice (default)
+      introEl.innerHTML =
+        '<div class="mode-intro-title">📘 练一题 · 教练陪你做一道题</div>' +
+        '<div class="mode-intro-body">' +
+          '这个软件用起来很简单：' +
+          '<ol>' +
+            '<li>在下面的"题目"框里粘贴一道你的题（已经预填了一道示例题，可以直接试）。</li>' +
+            '<li>点"开始陪练这道题"按钮，开始和我对话。</li>' +
+            '<li>我会通过提问帮你找到答案 —— 不会直接给答案。</li>' +
+          '</ol>' +
+          '卡住了也可以直接说"我卡住了"，我会帮你。' +
+        '</div>';
+    }
+  }
+
   updateExamUi();
 }
 
@@ -697,10 +729,13 @@ function getModeOpeningMessage(mode) {
     return '考试模式已开始。我不会给任何提示，请独立作答。完成后点"提交答案"，我才会帮你复盘。';
   }
   if (mode === 'micro_surgery') {
-    return '错题手术开始。\n\n这不是让你抄错题——抄一万遍，下次还是会错。我们要做的是把你这次错的原因，变成一个**自动触发的程序**，下次遇到同类题，大脑直接调用，不用再想。\n\n按三步来，依次在左边填：\n\n**第一步：定位病灶** —— 你这道题到底卡在哪一步？不是"粗心"，不是"没看清"，要具体到"我不知道这里要做什么"。\n\n**第二步：寻找线索** —— 题目里有什么字、什么条件，本来应该提醒你用上面那个方法的？这是触发器。\n\n**第三步：写下炒菜程序** —— 写成"以后看到 X，直接做 Y"的格式。越机械越好，目标是让大脑不用思考就能反应。\n\n---\n\n举个例子，几何题里有道题你做错了：\n\n• **病灶定位**：我不知道这里要加辅助线构造全等。\n• **触发线索**：题目里的"中点"两个字。\n• **写入程序**：以后看到"中点 + 线段倍数" → 直接倍长中线。\n\n看到没？现在你不用再"想"了——下次只要题目里出现"中点"，你的手会自动开始倍长中线。这才叫真正掌握。\n\n---\n\n准备好了，先把你这道错题在左边题目框写下来，然后开始第一步。每填完一步，可以让我帮你打磨。';
+    return '准备好了吗？把那道错题贴在左边，我们就开始第一步。';
   }
-  // practice (default)
-  return '好，我们开始这道题。先告诉我：你看了这道题第一感觉是什么？是哪一步让你觉得"这个我不太确定"？';
+  // practice (default) — 改得更具体、更有引导性，让学生有话可说
+  return '好，这道题我们一起看。先不急着算 —— 你读完题之后，先告诉我两件事：\n\n' +
+         '1. **你看懂题目在问什么了吗？** 哪个词或哪个条件让你不太确定？\n' +
+         '2. **如果让你现在动笔，第一步你打算干什么？** 哪怕只是"我想先把图画出来"也行。\n\n' +
+         '说出来就行，不用先想"对不对"。';
 }
 
 // 判断聊天框里是否有真正的对话(用户说过话)
@@ -771,11 +806,8 @@ document.querySelectorAll('.quick-actions button').forEach((btn) => {
 // Apply initial mode (in case user refreshes with exam or surgery preselected)
 applyModeUi(els.modeSelect ? els.modeSelect.value : 'practice');
 
-// 入口欢迎语 — 学生一打开页面就看到, 不用点任何按钮
-addMessage(
-  'assistant',
-  '欢迎使用茹意宝！\n\n这个软件使用起来很简单：\n1. 在左边的"题目"框里粘贴一道你的题（已经预填了一道示例题，可以直接试）。\n2. 点"开始陪练这道题"按钮，开始和我对话。\n3. 我会通过提问帮你找到答案——不会直接给答案。\n\n准备好了告诉我。卡住了也可以直接说"我卡住了"，我会帮你。',
-  'WELCOME'
-);
+// 注：以前这里有一段"欢迎使用茹意宝..."的聊天消息，现在那段说明已经
+// 搬到左边的功能介绍卡片里了，所以聊天框初始保持空，等学生点
+// "开始陪练这道题"再让教练开口。
 
 checkLlmHealth();

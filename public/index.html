@@ -35,6 +35,19 @@
       <main class="grid">
         <section class="panel question-panel">
           <div id="practicePanel">
+            <!-- 功能介绍：根据当前模式（练一题 / 考试模式）切换文字 -->
+            <div class="mode-intro" id="practiceIntro">
+              <div class="mode-intro-title">📘 练一题 · 教练陪你做一道题</div>
+              <div class="mode-intro-body">
+                这个软件用起来很简单：
+                <ol>
+                  <li>在下面的"题目"框里粘贴一道你的题（已经预填了一道示例题，可以直接试）。</li>
+                  <li>点"开始陪练这道题"按钮，开始和我对话。</li>
+                  <li>我会通过提问帮你找到答案 —— 不会直接给答案。</li>
+                </ol>
+                卡住了也可以直接说"我卡住了"，我会帮你。
+              </div>
+            </div>
             <h2>题目</h2>
             <textarea id="questionInput" rows="7" placeholder="输入一道中考数学题，例如：已知 y = x^2 - 4x + 3，求最小值。">已知二次函数 y = x² - 4x + 3。(1) 求函数的对称轴和顶点坐标。(2) 当 x 在什么范围内时，y < 0？(3) 若把图象向右平移 2 个单位，再向下平移 1 个单位，求新函数的解析式。</textarea>
             <div style="font-size:12px;color:var(--muted);margin-top:-4px;margin-bottom:10px;" id="exampleHint">
@@ -72,12 +85,22 @@
           </div>
 
           <div id="surgeryPanel" style="display:none;">
+            <div class="mode-intro">
+              <div class="mode-intro-title">🛠️ 错题手术 · 把一道错题做成"如果…就…"的程序</div>
+              <div class="mode-intro-body">
+                抄一百遍错题没用，下次还是会错。我们要做的是把这次错的原因，
+                变成大脑里的一条<strong>触发器</strong>，下次见到同类题直接反应。
+                <ol>
+                  <li>先在下面"这道错题"框里把题贴上。</li>
+                  <li>按三步走：① <strong>定位病灶</strong>（错在哪个具体的概念/公式）→
+                    ② <strong>寻找线索</strong>（题目里哪个词应该提醒你用这个方法）→
+                    ③ <strong>写下口诀</strong>（"以后看到 X，直接做 Y"）。</li>
+                  <li>每填完一步，可以点"让教练打磨这一步"，我会帮你看够不够具体。</li>
+                </ol>
+                三步都写完，点"生成我的错题手术卡"，就有一张属于你自己的口诀卡。
+              </div>
+            </div>
             <h2>错题手术</h2>
-            <p class="surgery-intro">
-              回忆你最近试卷上的一道错题，在这里给它做三步"微型手术"。
-              提分的本质，是把你大脑里模糊的"直觉"，变成清晰的"如果…就…"的程序。
-              积累的程序越多，考试时翻车的概率就越低。
-            </p>
             <div class="row">
               <button id="newSurgeryBtn">开始新手术</button>
               <button id="loadSurgeryCardBtn" class="secondary">查看手术卡</button>
