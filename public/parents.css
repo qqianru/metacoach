@@ -94,21 +94,32 @@
   gap: 10px;
 }
 .sample-item {
+  /* Full <button> reset — without these, some browsers (notably Chrome on
+     desktop) leak their default blue background / white text / centered align
+     through. Mobile browsers are more lenient, which is why this only showed
+     up on desktop. */
+  -webkit-appearance: none;
+  appearance: none;
   display: block;
   width: 100%;
   text-align: left;
+  color: var(--text);
+  font: inherit;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 14px 18px;
   cursor: pointer;
-  transition: all 0.15s ease;
-  font-family: inherit;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
 }
 .sample-item:hover {
   border-color: var(--primary);
   background: var(--primary-soft);
   transform: translateY(-1px);
+}
+.sample-item:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 .sample-row {
   display: flex;
