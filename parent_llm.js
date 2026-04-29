@@ -23,18 +23,19 @@ function loadSystemPrompt() {
   try {
     const instructions = fs.readFileSync(path.join(PROMPT_DIR, '03_system_prompt.md'), 'utf8');
     const framework = fs.readFileSync(path.join(PROMPT_DIR, '01_framework.md'), 'utf8');
-    const cases = fs.readFileSync(path.join(PROMPT_DIR, '02_case_index.md'), 'utf8');
-    // 顺序: 指令 → 框架 → 案例库
+    // 注意: 不再加载 02_case_index.md 到 system prompt
+    // 原因: 36KB 的案例库让 prompt 长度翻倍, 显著拖慢首字延迟。
+    // 框架文件已经包含了所有机制和工具, 足够支撑大多数对话。
+    // 如果后续要加回案例匹配, 用 RAG 在用户消息触发时按需注入更好。
     cachedSystemPrompt =
-      instructions + '\n\n---\n\n# 框架核心 (framework.md)\n\n' + framework +
-      '\n\n---\n\n# 案例库索引 (case_index.md)\n\n' + cases;
+      instructions + '\n\n---\n\n# 框架核心 (framework.md)\n\n' + framework;
     const sizeKB = Math.round(cachedSystemPrompt.length / 1024);
     const charCount = cachedSystemPrompt.length;
-    console.log(`[ParentLLM] System prompt loaded: ${charCount} chars ≈ ${sizeKB}KB ≈ ${Math.round(charCount * 1.5 / 1000)}K tokens`);
+    console.log(`[ParentLLM] System prompt loaded: ${charCount} chars ≈ ${sizeKB}KB ≈ ${Math.round(charCount * 1.5 / 1000)}K tokens (case_index 已剥离, 提速)`);
     return cachedSystemPrompt;
   } catch (err) {
     console.error('[ParentLLM] Failed to load system prompt files:', err.message);
-    console.error('[ParentLLM] Make sure server/prompts/01_framework.md, 02_case_index.md, 03_system_prompt.md exist');
+    console.error('[ParentLLM] Make sure server/prompts/01_framework.md and 03_system_prompt.md exist');
     return null;
   }
 }
