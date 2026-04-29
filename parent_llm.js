@@ -104,8 +104,9 @@ async function generateParentCoachReply(messages) {
           messages: apiMessages,
           temperature: 0.7,
           max_tokens: 600,
-          // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
-          chat_template_kwargs: { enable_thinking: false }
+          // 关闭思考模式 (glm-4.7-flash 默认开启 thinking, 会吃掉 max_tokens)
+          // BigModel 官方平台用 thinking.type, 不是 chat_template_kwargs
+          thinking: { type: 'disabled' }
         });
 
         const content = resp.choices?.[0]?.message?.content || '';
@@ -199,8 +200,9 @@ async function generateParentCoachReplyStream(messages, onToken, onError) {
         temperature: 0.7,
         max_tokens: 600,
         stream: true,
-        // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
-        chat_template_kwargs: { enable_thinking: false }
+        // 关闭思考模式 (glm-4.7-flash 默认开启 thinking, 会吃掉 max_tokens)
+        // BigModel 官方平台用 thinking.type, 不是 chat_template_kwargs
+        thinking: { type: 'disabled' }
         // 注意: 去掉了 stream_options.include_usage — GLM 某些 model 不支持会报错
       });
 
@@ -368,8 +370,9 @@ async function generateConversationSummary(messages) {
       ],
       temperature: 0.3,
       max_tokens: 300,
-      // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
-      chat_template_kwargs: { enable_thinking: false }
+      // 关闭思考模式 (glm-4.7-flash 默认开启 thinking, 会吃掉 max_tokens)
+      // BigModel 官方平台用 thinking.type, 不是 chat_template_kwargs
+      thinking: { type: 'disabled' }
     });
     return resp.choices?.[0]?.message?.content || '(摘要为空)';
   } catch (err) {
