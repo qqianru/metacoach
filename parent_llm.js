@@ -103,7 +103,9 @@ async function generateParentCoachReply(messages) {
           model: getParentModel(),
           messages: apiMessages,
           temperature: 0.7,
-          max_tokens: 600
+          max_tokens: 600,
+          // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
+          chat_template_kwargs: { enable_thinking: false }
         });
 
         const content = resp.choices?.[0]?.message?.content || '';
@@ -196,7 +198,9 @@ async function generateParentCoachReplyStream(messages, onToken, onError) {
         messages: apiMessages,
         temperature: 0.7,
         max_tokens: 600,
-        stream: true
+        stream: true,
+        // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
+        chat_template_kwargs: { enable_thinking: false }
         // 注意: 去掉了 stream_options.include_usage — GLM 某些 model 不支持会报错
       });
 
@@ -363,7 +367,9 @@ async function generateConversationSummary(messages) {
         { role: 'user', content: transcript }
       ],
       temperature: 0.3,
-      max_tokens: 300
+      max_tokens: 300,
+      // 关闭思考模式 (glm-4.7-flash 默认开启 thinking)
+      chat_template_kwargs: { enable_thinking: false }
     });
     return resp.choices?.[0]?.message?.content || '(摘要为空)';
   } catch (err) {
